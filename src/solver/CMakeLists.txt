@@ -32,6 +32,16 @@ file(GLOB
         RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *.c *.h
 )
 
+# Add GPU sources if CUDA is enabled
+if(BUILD_GPU)
+    file(GLOB GPU_SOURCES
+        RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+        gpu/*.cu gpu/*.cuh gpu/*.h
+    )
+    list(APPEND SWMM_SOURCES ${GPU_SOURCES})
+    message(STATUS "SWMM-GPU: Adding GPU source files")
+endif()
+
 if(BUILD_DEF)
     # Build library with def file interface for backward compatibility
     set_source_files_properties(${PROJECT_SOURCE_DIR}/bindings/swmm5.def
@@ -79,6 +89,9 @@ target_include_directories(swmm5
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${INCLUDE_DIST}>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        $<$<BOOL:${BUILD_GPU}>:${CMAKE_CURRENT_SOURCE_DIR}/gpu>
 )
 
 install(TARGETS swmm5 EXPORT swmm5Targets

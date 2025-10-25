@@ -16,10 +16,22 @@ if("${CMAKE_BINARY_DIR}" STREQUAL "${CMAKE_SOURCE_DIR}")
 endif()
 
 
-project(swmm-solver
-    VERSION 5.2.4
-    LANGUAGES C CXX
-)
+# Check for GPU support option before project definition
+option(BUILD_GPU "Enable GPU acceleration with CUDA" OFF)
+
+# Determine languages based on BUILD_GPU option
+if(BUILD_GPU)
+    project(swmm-solver
+        VERSION 5.2.4
+        LANGUAGES C CXX CUDA
+    )
+    message(STATUS "SWMM-GPU: CUDA support enabled")
+else()
+    project(swmm-solver
+        VERSION 5.2.4
+        LANGUAGES C CXX
+    )
+endif()
 
 # Append local dir to module search path
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
@@ -43,6 +55,26 @@ set(CONFIG_DIST  "cmake")
 # Define build options
 option(BUILD_TESTS "Builds component tests (requires Boost)" OFF)
 option(BUILD_DEF   "Builds library with def file interface" OFF)
+
+# CUDA/GPU configuration
+if(BUILD_GPU)
+    # Set CUDA standard and architectures
+    set(CMAKE_CUDA_STANDARD 11)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+    # Default to compute capability 8.9 (RTX 4060), but allow override
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA architectures to build for")
+    endif()
+
+    # Enable separable compilation for device code
+    set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+
+    # Add GPU compile definition
+    add_compile_definitions(BUILD_GPU)
+
+    message(STATUS "SWMM-GPU: Target architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 
 # Add project subdirectories
