@@ -62,9 +62,9 @@ if(BUILD_GPU)
     set(CMAKE_CUDA_STANDARD 11)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-    # Default to compute capability 8.9 (RTX 4060), but allow override
+    # Support multiple GPUs: 89 (RTX 4060 laptop), 121 (GB10 DGX Spark)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING "CUDA architectures to build for")
+        set(CMAKE_CUDA_ARCHITECTURES "89;121" CACHE STRING "CUDA architectures to build for")
     endif()
 
     # Enable separable compilation for device code

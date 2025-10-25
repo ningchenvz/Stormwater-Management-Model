@@ -63,6 +63,10 @@ int gpu_initialize(void)
     g_gpuConfig.maxThreadsPerBlock = prop.maxThreadsPerBlock;
     g_gpuConfig.warpSize = prop.warpSize;
 
+    // Check unified memory support
+    g_gpuConfig.unifiedMemory = prop.managedMemory;
+    g_gpuConfig.concurrentManagedAccess = prop.concurrentManagedAccess;
+
     // Get available memory
     size_t freeMem, totalMem;
     err = cudaMemGetInfo(&freeMem, &totalMem);
@@ -97,6 +101,11 @@ int gpu_initialize(void)
            g_gpuConfig.totalMemory / (1024.0 * 1024.0 * 1024.0));
     printf("... Available Memory: %.2f GB\n",
            g_gpuConfig.availableMemory / (1024.0 * 1024.0 * 1024.0));
+    printf("... Unified Memory: %s\n",
+           g_gpuConfig.unifiedMemory ? "Supported" : "Not Supported");
+    if (g_gpuConfig.unifiedMemory && g_gpuConfig.concurrentManagedAccess) {
+        printf("... Concurrent Managed Access: Enabled (optimal for CPU/GPU interleaving)\n");
+    }
 
     return cudaSuccess;
 }
@@ -168,6 +177,8 @@ void gpu_printInfo(void)
     printf("  Multiprocessors: %d\n", g_gpuConfig.multiProcessorCount);
     printf("  Max Threads/Block: %d\n", g_gpuConfig.maxThreadsPerBlock);
     printf("  Warp Size: %d\n", g_gpuConfig.warpSize);
+    printf("  Unified Memory: %s\n", g_gpuConfig.unifiedMemory ? "Yes" : "No");
+    printf("  Concurrent Access: %s\n", g_gpuConfig.concurrentManagedAccess ? "Yes" : "No");
     printf("  GPU Min Links: %d\n", g_gpuConfig.minLinksForGPU);
     printf("  GPU Min Nodes: %d\n", g_gpuConfig.minNodesForGPU);
 }

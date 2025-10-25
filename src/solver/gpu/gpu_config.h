@@ -81,6 +81,8 @@ typedef struct {
     int warpSize;               // Warp size (typically 32)
     int minLinksForGPU;         // Minimum links to use GPU
     int minNodesForGPU;         // Minimum nodes to use GPU
+    int unifiedMemory;          // Supports unified memory (managed memory)
+    int concurrentManagedAccess;// Can access managed memory concurrently from CPU/GPU
 } GPUConfig;
 
 // Global GPU configuration (defined in gpu_manager.cu)
@@ -94,6 +96,12 @@ extern GPUConfig g_gpuConfig;
     int gpu_isEnabled(void);
     void gpu_setEnabled(int enabled);
     void gpu_printInfo(void);
+
+    // GPU test functions
+    int gpu_runAllTests(void);
+    int gpu_test_vectorAdd(int n);
+    int gpu_test_nodeStructure(int nodeCount);
+    int gpu_test_massBalance(int nodeCount);
 #else
     static inline int gpu_initialize(void) { return 0; }
     static inline void gpu_cleanup(void) {}
@@ -101,6 +109,7 @@ extern GPUConfig g_gpuConfig;
     static inline int gpu_isEnabled(void) { return 0; }
     static inline void gpu_setEnabled(int enabled) { (void)enabled; }
     static inline void gpu_printInfo(void) {}
+    static inline int gpu_runAllTests(void) { return 0; }
 #endif
 
 #ifdef __cplusplus

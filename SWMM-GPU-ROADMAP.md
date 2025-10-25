@@ -4,8 +4,12 @@
 
 **Goal:** Add CUDA GPU acceleration to SWMM's dynamic wave flow routing algorithm
 **Target Hardware:** NVIDIA GPUs (Compute Capability 6.0+)
-**Primary Development GPU:** RTX 4060 (Compute Capability 8.9)
+**Primary Development GPUs:**
+  - RTX 4060 (Compute Capability 8.9) - Laptop (discrete GPU)
+  - NVIDIA GB10 (Compute Capability 12.1) - DGX Spark (unified memory architecture)
 **Expected Speedup:** 5-15x for large models (1000+ links)
+
+**Note:** The DGX Spark uses unified memory, allowing CPU and GPU to share memory space with automatic migration. This simplifies memory management and may enable additional optimizations.
 
 ---
 
@@ -27,13 +31,20 @@
 
 | # | Task | Status | Estimated Time |
 |---|------|--------|----------------|
-| 4 | Design and implement GPU data structures (AoS to SoA conversion) | ⏳ Pending | 3-4 days |
-| 5 | Implement GPU memory management layer (allocation, transfer, deallocation) | ⏳ Pending | 2-3 days |
-| 6 | Create simple test kernel to verify CUDA pipeline works | ⏳ Pending | 1 day |
+| 4 | Design and implement GPU data structures (AoS to SoA conversion) | ✅ Complete | 3-4 days |
+| 5 | Implement GPU memory management layer (cudaMallocManaged for unified memory on DGX, cudaMalloc fallback for discrete GPUs) | ✅ Complete | 2-3 days |
+| 6 | Create simple test kernel to verify CUDA pipeline works | ✅ Complete | 1 day |
 
-**Phase 2 Total:** 6-8 days (~1.5 weeks)
+**Phase 2 Total:** 6-8 days (~1.5 weeks) - **COMPLETED**
 
-**Key Deliverable:** Working CUDA compilation and basic GPU memory allocation
+**Key Deliverable:** ✅ Working CUDA compilation and basic GPU memory allocation
+**Note:** Unified memory support on DGX simplifies implementation - using `cudaMallocManaged()` for automatic data migration
+
+**Completed Files:**
+- `src/solver/gpu/gpu_structures.h` - GPU SoA data structures
+- `src/solver/gpu/gpu_memory.cu` - Memory allocation/deallocation with unified memory support
+- `src/solver/gpu/gpu_test_kernels.cu` - Test kernels (vector add, node/link ops, mass balance)
+- All tests passing on NVIDIA GB10 (Compute Capability 12.1)
 
 ---
 
@@ -70,12 +81,13 @@
 | # | Task | Status | Estimated Time |
 |---|------|--------|----------------|
 | 13 | Add runtime GPU detection and CPU/GPU fallback logic in dynwave.c | ⏳ Pending | 2-3 days |
-| 14 | Optimize memory transfer patterns (minimize CPU-GPU copying) | ⏳ Pending | 2-3 days |
+| 14 | Optimize memory transfer patterns (prefetch hints for unified memory, minimize explicit copies for discrete GPUs) | ⏳ Pending | 2-3 days |
 | 15 | Tune CUDA kernel launch parameters (block size, grid size) | ⏳ Pending | 2-3 days |
 
 **Phase 5 Total:** 6-9 days (~1.5 weeks)
 
 **Key Deliverable:** Production-ready hybrid CPU/GPU execution
+**Note:** On DGX unified memory, use `cudaMemPrefetchAsync()` to hint data migration; on discrete GPUs, use explicit `cudaMemcpy()`
 
 ---
 
@@ -114,24 +126,24 @@
 
 ## Current Status (as of October 25, 2025)
 
-**Phase:** 1 (Infrastructure Setup)
-**Progress:** 3/20 tasks complete (15%)
+**Phase:** 2 (Data Structures) - **COMPLETED ✅**
+**Progress:** 6/20 tasks complete (30%)
 **Branch:** `feature/swmm-gpu-acceleration`
-**Next Milestone:** Complete Phase 2 (Data Structures)
+**Next Milestone:** Phase 3 (Simple Kernel Implementation)
 
 ### Completed
-- ✅ CUDA 12.4 verified on RTX 4060
-- ✅ CMake build system with BUILD_GPU option
+- ✅ CUDA development environment verified (CUDA 12.4 on RTX 4060, CUDA 13.0 on GB10 DGX)
+- ✅ CMake build system with BUILD_GPU option (multi-architecture support: 89, 121)
 - ✅ GPU directory structure created
-- ✅ Basic GPU manager implemented
+- ✅ Basic GPU manager with unified memory detection implemented
+- ✅ GPU SoA data structures designed (Node, Link, Conduit, XSect)
+- ✅ Memory management layer implemented (cudaMallocManaged + discrete GPU fallback)
+- ✅ Test kernels implemented and verified on DGX Spark
 
-### In Progress
-- Working on Phase 2: Data structure design
-
-### Upcoming
-- Design SoA data structures for Link/Node/Conduit
-- Implement GPU memory management
-- First test kernel
+### Next Phase
+- Phase 3: Implement helper device functions (getArea, getHydRad, etc.)
+- Port findNodeDepths to GPU kernel (simpler starting point)
+- Create CPU/GPU validation tests
 
 ---
 
@@ -140,9 +152,9 @@
 | Risk | Severity | Mitigation |
 |------|----------|------------|
 | Data structure conversion complexity | High | Start with simplified structures, iterate |
-| Memory transfer overhead | Medium | Keep data on GPU across iterations |
+| Memory transfer overhead | Low | DGX unified memory auto-migrates; prefetch hints optimize further |
 | Numerical accuracy differences | Medium | Rigorous testing, bit-exact comparisons |
-| Limited GPU memory (8GB) | Low | Model size limits, but sufficient for most cases |
+| GPU memory limitations | Low | RTX 4060: 8GB, DGX GB10: 120GB - more than sufficient |
 | CUDA learning curve | Medium | Start with simple kernels, build up complexity |
 
 ---
@@ -159,10 +171,10 @@
 
 ## Dependencies
 
-- CUDA Toolkit 12.x
+- CUDA Toolkit 12.x or 13.x
 - CMake 3.13+
-- NVIDIA GPU with Compute Capability 6.0+
-- NVIDIA driver 525+
+- NVIDIA GPU with Compute Capability 6.0+ (tested on 8.9 and 12.1)
+- NVIDIA driver 525+ (tested with 580.95.05)
 
 ---
 
