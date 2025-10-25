@@ -47,10 +47,12 @@ typedef struct {
     double* newDepth;           // Current water depth (ft)
     double* oldVolume;          // Previous volume (ft3)
     double* newVolume;          // Current volume (ft3)
+    double* fullVolume;         // Max storage available (ft3)
     double* oldNetInflow;       // Previous net inflow (cfs)
     double* inflow;             // Total inflow (cfs)
     double* outflow;            // Total outflow (cfs)
     double* overflow;           // Overflow rate (cfs)
+    int*    degree;             // Number of outflow links
 
     // Extended node data (from TXnode in dynwave.c)
     char*   converged;          // TRUE if iterations done for this node

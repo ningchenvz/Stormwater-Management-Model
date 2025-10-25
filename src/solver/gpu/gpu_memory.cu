@@ -72,10 +72,12 @@ int gpu_allocateNodeData(GPU_NodeData* data, int nodeCount)
     CUDA_ALLOC_MANAGED((void**)&data->newDepth, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->oldVolume, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->newVolume, doubleSize);
+    CUDA_ALLOC_MANAGED((void**)&data->fullVolume, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->oldNetInflow, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->inflow, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->outflow, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->overflow, doubleSize);
+    CUDA_ALLOC_MANAGED((void**)&data->degree, intSize);
 
     // Allocate extended data
     CUDA_ALLOC_MANAGED((void**)&data->converged, charSize);
@@ -108,10 +110,12 @@ void gpu_freeNodeData(GPU_NodeData* data)
     CUDA_FREE_SAFE(data->newDepth);
     CUDA_FREE_SAFE(data->oldVolume);
     CUDA_FREE_SAFE(data->newVolume);
+    CUDA_FREE_SAFE(data->fullVolume);
     CUDA_FREE_SAFE(data->oldNetInflow);
     CUDA_FREE_SAFE(data->inflow);
     CUDA_FREE_SAFE(data->outflow);
     CUDA_FREE_SAFE(data->overflow);
+    CUDA_FREE_SAFE(data->degree);
     CUDA_FREE_SAFE(data->converged);
     CUDA_FREE_SAFE(data->newSurfArea);
     CUDA_FREE_SAFE(data->oldSurfArea);
@@ -321,4 +325,122 @@ void gpu_freeXsectData(GPU_XsectData* data)
     CUDA_FREE_SAFE(data->yFull);
 
     data->count = 0;
+}
+
+//=============================================================================
+// Data Transfer Functions (CPU AoS -> GPU SoA)
+//=============================================================================
+// Note: These functions require knowledge of SWMM's internal structures
+//       Since gpu_memory.cu cannot directly include headers.h (circular deps),
+//       we use void* and cast internally or provide wrapper functions
+
+int gpu_transferNodeDataFromArrays(
+    GPU_NodeData* gpuData,
+    // Arrays from CPU
+    int* type,
+    double* invertElev,
+    double* fullDepth,
+    double* surDepth,
+    double* pondedArea,
+    double* crownElev,
+    double* oldDepth,
+    double* newDepth,
+    double* oldVolume,
+    double* newVolume,
+    double* oldNetInflow,
+    double* inflow,
+    double* outflow,
+    int count)
+//
+//  Purpose: Transfers node data from CPU arrays to GPU SoA structure
+//  Input:   gpuData = pre-allocated GPU_NodeData structure
+//           Arrays = pointers to CPU data arrays
+//           count = number of nodes
+//  Returns: 0 if successful, error code otherwise
+//
+//  Note: This function assumes gpuData is already allocated via
+//        gpu_allocateNodeData(). It copies data from CPU arrays
+//        into the GPU SoA structure. With unified memory, this is
+//        just memcpy. With discrete GPUs, would need cudaMemcpy.
+//
+{
+    if (gpuData == NULL || count <= 0) return -1;
+    if (gpuData->count != count) return -1;
+
+    size_t intSize = count * sizeof(int);
+    size_t doubleSize = count * sizeof(double);
+
+    // Copy static properties
+    if (g_gpuConfig.unifiedMemory) {
+        // Unified memory: simple memcpy
+        memcpy(gpuData->type, type, intSize);
+        memcpy(gpuData->invertElev, invertElev, doubleSize);
+        memcpy(gpuData->fullDepth, fullDepth, doubleSize);
+        memcpy(gpuData->surDepth, surDepth, doubleSize);
+        memcpy(gpuData->pondedArea, pondedArea, doubleSize);
+        memcpy(gpuData->crownElev, crownElev, doubleSize);
+        memcpy(gpuData->oldDepth, oldDepth, doubleSize);
+        memcpy(gpuData->newDepth, newDepth, doubleSize);
+        memcpy(gpuData->oldVolume, oldVolume, doubleSize);
+        memcpy(gpuData->newVolume, newVolume, doubleSize);
+        memcpy(gpuData->oldNetInflow, oldNetInflow, doubleSize);
+        memcpy(gpuData->inflow, inflow, doubleSize);
+        memcpy(gpuData->outflow, outflow, doubleSize);
+    } else {
+        // Discrete GPU: explicit copy to device
+        CUDA_CHECK(cudaMemcpy(gpuData->type, type, intSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->invertElev, invertElev, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->fullDepth, fullDepth, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->surDepth, surDepth, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->pondedArea, pondedArea, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->crownElev, crownElev, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->oldDepth, oldDepth, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->newDepth, newDepth, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->oldVolume, oldVolume, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->newVolume, newVolume, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->oldNetInflow, oldNetInflow, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->inflow, inflow, doubleSize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpuData->outflow, outflow, doubleSize, cudaMemcpyHostToDevice));
+    }
+
+    return 0;
+}
+
+//=============================================================================
+
+int gpu_retrieveNodeDataToArrays(
+    // GPU data
+    GPU_NodeData* gpuData,
+    // CPU arrays to fill
+    double* newDepth,
+    double* newVolume,
+    double* overflow,
+    int count)
+//
+//  Purpose: Retrieves computed node data from GPU back to CPU arrays
+//  Input:   gpuData = GPU_NodeData structure with computed results
+//           Arrays = pointers to CPU arrays to fill
+//           count = number of nodes
+//  Returns: 0 if successful, error code otherwise
+//
+{
+    if (gpuData == NULL || count <= 0) return -1;
+    if (gpuData->count != count) return -1;
+
+    size_t doubleSize = count * sizeof(double);
+
+    // Copy results back
+    if (g_gpuConfig.unifiedMemory) {
+        // Unified memory: simple memcpy
+        memcpy(newDepth, gpuData->newDepth, doubleSize);
+        memcpy(newVolume, gpuData->newVolume, doubleSize);
+        memcpy(overflow, gpuData->overflow, doubleSize);
+    } else {
+        // Discrete GPU: explicit copy from device
+        CUDA_CHECK(cudaMemcpy(newDepth, gpuData->newDepth, doubleSize, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(newVolume, gpuData->newVolume, doubleSize, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(overflow, gpuData->overflow, doubleSize, cudaMemcpyDeviceToHost));
+    }
+
+    return 0;
 }
