@@ -126,24 +126,33 @@
 
 ## Current Status (as of October 25, 2025)
 
-**Phase:** 2 (Data Structures) - **COMPLETED ✅**
-**Progress:** 6/20 tasks complete (30%)
+**Phase:** 3/4 Transition - **Phase 3 Core Complete, Phase 4 Planning Done ✅**
+**Progress:** 9/20 tasks complete (45%)
 **Branch:** `feature/swmm-gpu-acceleration`
-**Next Milestone:** Phase 3 (Simple Kernel Implementation)
+**Next Milestone:** Phase 4 Implementation (Complex Kernels)
 
-### Completed
+### Completed (Phases 1-3)
 - ✅ CUDA development environment verified (CUDA 12.4 on RTX 4060, CUDA 13.0 on GB10 DGX)
 - ✅ CMake build system with BUILD_GPU option (multi-architecture support: 89, 121)
 - ✅ GPU directory structure created
 - ✅ Basic GPU manager with unified memory detection implemented
 - ✅ GPU SoA data structures designed (Node, Link, Conduit, XSect)
 - ✅ Memory management layer implemented (cudaMallocManaged + discrete GPU fallback)
-- ✅ Test kernels implemented and verified on DGX Spark
+- ✅ Test kernels verified on DGX Spark (all passing)
+- ✅ Device helper functions ported (node_getVolume, getFloodedDepth, setNodeDepth)
+- ✅ findNodeDepths GPU kernel implemented
+- ✅ Data transfer functions (CPU AoS ↔ GPU SoA)
+- ✅ Phase 4 analysis and implementation plan complete
 
-### Next Phase
-- Phase 3: Implement helper device functions (getArea, getHydRad, etc.)
-- Port findNodeDepths to GPU kernel (simpler starting point)
-- Create CPU/GPU validation tests
+### In Progress (Phase 4)
+- ⏳ Cross-section helper functions (getArea, getHydRad, getSlotWidth)
+- ⏳ Simplified gpu_findConduitFlow() device function
+- ⏳ kernel_findConduitFlows() GPU kernel
+
+### Next Actions
+- Implement cross-section geometry helpers
+- Create simplified conduit flow kernel for regular conduits
+- Add validation tests comparing CPU vs GPU results
 
 ---
 
