@@ -59,6 +59,7 @@ typedef struct {
     double* newSurfArea;        // Current surface area (ft2)
     double* oldSurfArea;        // Previous surface area (ft2)
     double* sumdqdh;            // Sum of dqdh from adjoining links
+    double* dYdT;               // Change in depth w.r.t. time (ft/sec)
 
 } GPU_NodeData;
 
@@ -91,10 +92,12 @@ typedef struct {
     double* surfArea1;          // Upstream surface area (ft2)
     double* surfArea2;          // Downstream surface area (ft2)
     double* dqdh;               // Change in flow w.r.t. head (ft2/sec)
+    double* froude;             // Froude number
 
     // Control flags
     char*   bypassed;           // Bypass dynwave calculation flag
     signed char* direction;     // Flow direction flag
+    signed char* flowClass;     // Flow classification (DRY, SUBCRITICAL, etc.)
 
 } GPU_LinkData;
 
@@ -144,6 +147,11 @@ typedef struct {
     double* rFull;              // Hydraulic radius when full (ft)
     double* wMax;               // Max width (ft)
     double* yFull;              // Full depth (ft)
+
+    // Geometry parameters for different cross-section shapes
+    double* geom1;              // Geometry parameter 1 (diameter, width, etc.)
+    double* geom2;              // Geometry parameter 2 (height, side slope, etc.)
+    double* geom3;              // Geometry parameter 3 (additional geometry)
 
 } GPU_XsectData;
 

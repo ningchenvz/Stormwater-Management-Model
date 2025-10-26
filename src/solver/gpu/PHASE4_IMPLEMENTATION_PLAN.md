@@ -34,6 +34,12 @@ Phase 4 implements the most computationally intensive kernel: `findConduitFlows`
 
 ## Implementation Strategy
 
+### Stage 0: CUDA Enablement (Prerequisite)
+- Add `ENABLE_CUDA` CMake option and ensure `gpu_dwflow.cu` is compiled when the flag is set
+- Implement runtime device selection + capability check (fallback to CPU if no CUDA GPU detected)
+- Wire a `g_gpuConfig.useCuda` toggle through the solver so time-step orchestration can switch between CPU/GPU at runtime
+- Add lightweight perf counters (kernel time, memcpy time) so we can validate the CUDA path actually accelerates SWMM on DGX Spark
+
 ### Stage 1: Simplified Version (Current Focus)
 - Implement core momentum equation solver
 - Support regular conduits only (no force mains, culverts)
@@ -125,7 +131,8 @@ gpu_dwflow.cu              // Kernel launch wrapper
 ---
 
 **Next Actions:**
-1. Implement cross-section helpers (getArea, getHydRad, getSlotWidth)
-2. Create simplified gpu_findConduitFlow() for regular conduits
-3. Implement kernel_findConduitFlows() kernel
-4. Add basic validation tests
+1. Stand up CUDA build flag + runtime device detection (Stage 0)
+2. Implement cross-section helpers (getArea, getHydRad, getSlotWidth)
+3. Create simplified gpu_findConduitFlow() for regular conduits
+4. Implement kernel_findConduitFlows() kernel
+5. Add basic validation + perf sanity tests (CPU vs CUDA)

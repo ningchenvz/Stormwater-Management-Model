@@ -69,7 +69,6 @@ static void   updateNodeDepth(int node, double y);
 static int    steadyflow_execute(int link, double* qin, double* qout,
               double tStep);
 
-
 //=============================================================================
 
 void flowrout_init(int routingModel)

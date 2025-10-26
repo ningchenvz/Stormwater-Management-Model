@@ -84,6 +84,7 @@ int gpu_allocateNodeData(GPU_NodeData* data, int nodeCount)
     CUDA_ALLOC_MANAGED((void**)&data->newSurfArea, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->oldSurfArea, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->sumdqdh, doubleSize);
+    CUDA_ALLOC_MANAGED((void**)&data->dYdT, doubleSize);
 
     printf("... Allocated GPU memory for %d nodes (%.2f MB)\n",
            nodeCount, (6 * doubleSize + 11 * doubleSize + intSize + charSize) / (1024.0 * 1024.0));
@@ -120,6 +121,7 @@ void gpu_freeNodeData(GPU_NodeData* data)
     CUDA_FREE_SAFE(data->newSurfArea);
     CUDA_FREE_SAFE(data->oldSurfArea);
     CUDA_FREE_SAFE(data->sumdqdh);
+    CUDA_FREE_SAFE(data->dYdT);
 
     data->count = 0;
 }
@@ -164,13 +166,15 @@ int gpu_allocateLinkData(GPU_LinkData* data, int linkCount)
     CUDA_ALLOC_MANAGED((void**)&data->surfArea1, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->surfArea2, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->dqdh, doubleSize);
+    CUDA_ALLOC_MANAGED((void**)&data->froude, doubleSize);
 
     // Allocate flags
     CUDA_ALLOC_MANAGED((void**)&data->bypassed, charSize);
     CUDA_ALLOC_MANAGED((void**)&data->direction, scharSize);
+    CUDA_ALLOC_MANAGED((void**)&data->flowClass, scharSize);
 
     printf("... Allocated GPU memory for %d links (%.2f MB)\n",
-           linkCount, (4 * intSize + 12 * doubleSize + charSize + scharSize) / (1024.0 * 1024.0));
+           linkCount, (4 * intSize + 12 * doubleSize + charSize + 2 * scharSize) / (1024.0 * 1024.0));
 
     return 0;
 }
@@ -200,8 +204,10 @@ void gpu_freeLinkData(GPU_LinkData* data)
     CUDA_FREE_SAFE(data->surfArea1);
     CUDA_FREE_SAFE(data->surfArea2);
     CUDA_FREE_SAFE(data->dqdh);
+    CUDA_FREE_SAFE(data->froude);
     CUDA_FREE_SAFE(data->bypassed);
     CUDA_FREE_SAFE(data->direction);
+    CUDA_FREE_SAFE(data->flowClass);
 
     data->count = 0;
 }
@@ -302,9 +308,12 @@ int gpu_allocateXsectData(GPU_XsectData* data, int xsectCount)
     CUDA_ALLOC_MANAGED((void**)&data->rFull, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->wMax, doubleSize);
     CUDA_ALLOC_MANAGED((void**)&data->yFull, doubleSize);
+    CUDA_ALLOC_MANAGED((void**)&data->geom1, doubleSize);
+    CUDA_ALLOC_MANAGED((void**)&data->geom2, doubleSize);
+    CUDA_ALLOC_MANAGED((void**)&data->geom3, doubleSize);
 
     printf("... Allocated GPU memory for %d cross-sections (%.2f MB)\n",
-           xsectCount, (intSize + 4 * doubleSize) / (1024.0 * 1024.0));
+           xsectCount, (intSize + 8 * doubleSize) / (1024.0 * 1024.0));
 
     return 0;
 }
@@ -323,6 +332,9 @@ void gpu_freeXsectData(GPU_XsectData* data)
     CUDA_FREE_SAFE(data->rFull);
     CUDA_FREE_SAFE(data->wMax);
     CUDA_FREE_SAFE(data->yFull);
+    CUDA_FREE_SAFE(data->geom1);
+    CUDA_FREE_SAFE(data->geom2);
+    CUDA_FREE_SAFE(data->geom3);
 
     data->count = 0;
 }

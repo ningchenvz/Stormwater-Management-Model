@@ -112,6 +112,14 @@ findLinkFlows<<<grid, block>>>(...);
 cudaMemPrefetchAsync(nodeData->depth, size, cudaCpuDeviceId);
 ```
 
+## CUDA Build & Activation Checklist
+
+1. **Enable CUDA in CMake:** Add `-DENABLE_CUDA=ON` (defaults to ON for DGX Spark presets) so `gpu_*.cu` sources are compiled into the solver.
+2. **Validate GPU availability:** At startup, call `cudaGetDeviceCount`/`cudaGetDeviceProperties`; log compute capability and unified memory support, then set `g_gpuConfig.useCuda`.
+3. **Runtime toggle:** Expose a CLI/env toggle (e.g., `SWMM_USE_CUDA=1`) so users can opt-in/out without recompiling.
+4. **Perf guard-rails:** Capture kernel + memcpy timings via `cudaEvent` pairs; print a short summary when CUDA is enabled so we can confirm the speedup path is active.
+5. **Fallback path:** If CUDA initialization fails, fall back to CPU execution immediately and emit a warning rather than crashing.
+
 ## Performance Considerations
 
 ### Advantages on DGX Spark

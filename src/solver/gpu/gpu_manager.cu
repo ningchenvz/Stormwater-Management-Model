@@ -12,10 +12,19 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "gpu_config.h"
+#include "gpu_structures.h"
 
 // Global GPU configuration
 GPUConfig g_gpuConfig = {0};
+GPUPerfStats g_gpuPerfStats = {0};
+
+// Global GPU data structures for dynamic wave routing
+GPU_NodeData g_gpuNodes = {0};
+GPU_LinkData g_gpuLinks = {0};
+GPU_ConduitData g_gpuConduits = {0};
+GPU_XsectData g_gpuXsects = {0};
 
 //=============================================================================
 
@@ -90,10 +99,12 @@ int gpu_initialize(void)
     // Mark as available and enabled by default
     g_gpuConfig.available = 1;
     g_gpuConfig.enabled = 1;
+    g_gpuConfig.useCuda = 0;
 
     // Set default thresholds
     g_gpuConfig.minLinksForGPU = GPU_MIN_LINKS_DEFAULT;
     g_gpuConfig.minNodesForGPU = GPU_MIN_NODES_DEFAULT;
+    gpu_profiler_reset();
 
     printf("\n... GPU Initialized: %s\n", prop.name);
     printf("... Compute Capability: %d.%d\n", prop.major, prop.minor);
@@ -121,7 +132,9 @@ void gpu_cleanup(void)
         cudaDeviceReset();
         g_gpuConfig.available = 0;
         g_gpuConfig.enabled = 0;
+        g_gpuConfig.useCuda = 0;
     }
+    gpu_profiler_reset();
 }
 
 //=============================================================================
@@ -181,4 +194,43 @@ void gpu_printInfo(void)
     printf("  Concurrent Access: %s\n", g_gpuConfig.concurrentManagedAccess ? "Yes" : "No");
     printf("  GPU Min Links: %d\n", g_gpuConfig.minLinksForGPU);
     printf("  GPU Min Nodes: %d\n", g_gpuConfig.minNodesForGPU);
+}
+
+//=============================================================================
+
+void gpu_profiler_reset(void)
+{
+    memset(&g_gpuPerfStats, 0, sizeof(GPUPerfStats));
+}
+
+//=============================================================================
+
+void gpu_profiler_addKernelTime(double ms)
+{
+    g_gpuPerfStats.kernelTimeMs += ms;
+    g_gpuPerfStats.kernelLaunches++;
+}
+
+//=============================================================================
+
+void gpu_profiler_addMemcpyTime(double ms)
+{
+    g_gpuPerfStats.memcpyTimeMs += ms;
+    g_gpuPerfStats.memcpyCalls++;
+}
+
+//=============================================================================
+
+void gpu_profiler_printSummary(void)
+//
+//  Purpose: Print simple CUDA timing summary for diagnostics
+//
+{
+    if (!g_gpuConfig.useCuda) return;
+
+    printf("\n  CUDA Performance Summary:\n");
+    printf("    Kernel launches : %6d  (%.3f ms total)\n",
+           g_gpuPerfStats.kernelLaunches, g_gpuPerfStats.kernelTimeMs);
+    printf("    Memcpy/prefetch : %6d  (%.3f ms total)\n",
+           g_gpuPerfStats.memcpyCalls, g_gpuPerfStats.memcpyTimeMs);
 }

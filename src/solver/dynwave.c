@@ -53,6 +53,38 @@
 #include <stdlib.h>
 #include <math.h>
 #include "headers.h"
+#include "dynwave_data.h"
+#ifdef BUILD_GPU
+#include "gpu_config.h"
+#include "gpu_structures.h"
+
+int gpu_runNodeDepthKernel(
+    double dt,
+    int allowPonding,
+    int surchargeMethod,
+    double minSurfArea,
+    int steps,
+    double omega,
+    double headTol);
+
+int gpu_computeConduitFlows(
+    GPU_LinkData* links,
+    GPU_ConduitData* conduits,
+    GPU_XsectData* xsects,
+    GPU_NodeData* nodes,
+    double dt,
+    int steps,
+    double omega,
+    int surchargeMethod,
+    double crownCutoff,
+    int inertDamping);
+
+// External GPU data structures (assumed to be allocated/managed elsewhere)
+extern GPU_LinkData g_gpuLinks;
+extern GPU_ConduitData g_gpuConduits;
+extern GPU_XsectData g_gpuXsects;
+extern GPU_NodeData g_gpuNodes;
+#endif
 
 //-----------------------------------------------------------------------------
 //     Constants 
@@ -69,20 +101,11 @@ static const int    DEFAULT_MAXTRIALS   = 8;      // Max. trials per time step
 //-----------------------------------------------------------------------------
 //  Data Structures
 //-----------------------------------------------------------------------------
-typedef struct 
-{
-    char    converged;                 // TRUE if iterations for a node done
-    double  newSurfArea;               // current surface area (ft2)
-    double  oldSurfArea;               // previous surface area (ft2)
-    double  sumdqdh;                   // sum of dqdh from adjoining links
-    double  dYdT;                      // change in depth w.r.t. time (ft/sec)
-} TXnode;
-
 //-----------------------------------------------------------------------------
 //  Shared Variables
 //-----------------------------------------------------------------------------
 static double  VariableStep;           // size of variable time step (sec)
-static TXnode* Xnode;                  // extended nodal information
+TXnode* Xnode = NULL;                  // extended nodal information
 
 static double  Omega;                  // actual under-relaxation parameter
 static int     Steps;                  // number of Picard iterations
@@ -383,7 +406,32 @@ void findLinkFlows(double dt)
 {
     int i;
 
-    // --- find new flow in each non-dummy conduit
+#ifdef BUILD_GPU
+    // --- try GPU path first if enabled
+    if (g_gpuConfig.useCuda)
+    {
+        double crownCutoff = (SurchargeMethod == EXTRAN) ? EXTRAN_CROWN_CUTOFF : SLOT_CROWN_CUTOFF;
+
+        int gpuResult = gpu_computeConduitFlows(
+            &g_gpuLinks,
+            &g_gpuConduits,
+            &g_gpuXsects,
+            &g_gpuNodes,
+            dt,
+            Steps,
+            Omega,
+            SurchargeMethod,
+            crownCutoff,
+            InertDamping);
+
+        // If GPU succeeded, return (node flows already updated by GPU)
+        if (gpuResult == 0) return;
+
+        // Otherwise fall through to CPU path
+    }
+#endif
+
+    // --- find new flow in each non-dummy conduit (CPU path)
 #pragma omp parallel num_threads(NumThreads)
 {
     #pragma omp for
@@ -603,6 +651,33 @@ int findNodeDepths(double dt)
 
     // --- compute outfall depths based on flow in connecting link
     for ( i = 0; i < Nobjects[LINK]; i++ ) link_setOutfallDepth(i);
+
+#ifdef BUILD_GPU
+    // TEMPORARY: Disable GPU node depth kernel to debug conduit kernel
+    // Use CPU for node depths, GPU only for conduit flows
+    /*
+    if (g_gpuConfig.useCuda)
+    {
+        int gpuConverged = gpu_runNodeDepthKernel(
+            dt,
+            AllowPonding,
+            SurchargeMethod,
+            MinSurfArea,
+            Steps,
+            Omega,
+            HeadTol);
+        if (gpuConverged >= 0)
+        {
+            for (i = 0; i < Nobjects[NODE]; i++)
+            {
+                if ( Node[i].type == OUTFALL ) continue;
+                if (Xnode[i].converged == FALSE) return FALSE;
+            }
+            return TRUE;
+        }
+    }
+    */
+#endif
 
     // --- compute new depth for all non-outfall nodes and determine if
     //     depth change from previous iteration is below tolerance

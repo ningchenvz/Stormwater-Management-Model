@@ -71,6 +71,7 @@ extern "C" {
 typedef struct {
     int available;              // GPU is available
     int enabled;                // User enabled GPU acceleration
+    int useCuda;                // Runtime decision to execute CUDA path
     int deviceCount;            // Number of CUDA devices
     int activeDevice;           // Active device ID
     int computeCapability;      // Compute capability (major * 10 + minor)
@@ -85,8 +86,16 @@ typedef struct {
     int concurrentManagedAccess;// Can access managed memory concurrently from CPU/GPU
 } GPUConfig;
 
+typedef struct {
+    double kernelTimeMs;        // Total time spent in CUDA kernels
+    double memcpyTimeMs;        // Total time spent in cudaMemcpy/prefetch
+    int    kernelLaunches;      // Number of kernel launches profiled
+    int    memcpyCalls;         // Number of memcpy/prefetch calls profiled
+} GPUPerfStats;
+
 // Global GPU configuration (defined in gpu_manager.cu)
 extern GPUConfig g_gpuConfig;
+extern GPUPerfStats g_gpuPerfStats;
 
 // GPU initialization and cleanup
 #ifdef BUILD_GPU
@@ -102,6 +111,12 @@ extern GPUConfig g_gpuConfig;
     int gpu_test_vectorAdd(int n);
     int gpu_test_nodeStructure(int nodeCount);
     int gpu_test_massBalance(int nodeCount);
+
+    // Performance profiling helpers
+    void gpu_profiler_reset(void);
+    void gpu_profiler_addKernelTime(double ms);
+    void gpu_profiler_addMemcpyTime(double ms);
+    void gpu_profiler_printSummary(void);
 #else
     static inline int gpu_initialize(void) { return 0; }
     static inline void gpu_cleanup(void) {}
@@ -110,6 +125,10 @@ extern GPUConfig g_gpuConfig;
     static inline void gpu_setEnabled(int enabled) { (void)enabled; }
     static inline void gpu_printInfo(void) {}
     static inline int gpu_runAllTests(void) { return 0; }
+    static inline void gpu_profiler_reset(void) {}
+    static inline void gpu_profiler_addKernelTime(double ms) { (void)ms; }
+    static inline void gpu_profiler_addMemcpyTime(double ms) { (void)ms; }
+    static inline void gpu_profiler_printSummary(void) {}
 #endif
 
 #ifdef __cplusplus

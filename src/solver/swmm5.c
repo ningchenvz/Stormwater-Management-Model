@@ -80,6 +80,7 @@
 #include <math.h>
 #include <time.h>
 #include <float.h>
+#include <ctype.h>
 
 //-----------------------------------------------------------------------------
 //  SWMM's header files
@@ -94,6 +95,9 @@
 #include "funcs.h"                     // declaration of all global functions
 #include "error.h"                     // error message codes
 #include "text.h"                      // listing of all text strings 
+#ifdef BUILD_GPU
+#include "gpu_config.h"
+#endif
 
 #include "swmm5.h"                     // declaration of SWMM's API functions
 
@@ -129,6 +133,11 @@ static int    ExceptionCount;       // number of exceptions handled
 static int    DoRunoff;             // TRUE if runoff is computed
 static int    DoRouting;            // TRUE if flow routing is computed
 static double RoutingDuration;      // duration of a set of routing steps (msecs)
+
+#ifdef BUILD_GPU
+static int    GpuInitAttempted = 0;    // ensures cuda init only happens once
+static int    GpuUsageConfigured = 0;  // ensures runtime decision logged once
+#endif
 
 //-----------------------------------------------------------------------------
 //  External API functions (prototyped in swmm5.h)
@@ -179,6 +188,13 @@ static void   getAbsolutePath(const char* fname, char* absPath, size_t size);
 // Exception filtering function
 #ifdef EXH
 static int  xfilter(int xc, char* module, double elapsedTime, long step);
+#endif
+
+#ifdef BUILD_GPU
+static void   swmm_gpu_initialize_if_needed(void);
+static void   swmm_gpu_configure_runtime(void);
+static void   swmm_gpu_log_summary(void);
+static int    swmm_gpu_parse_env(const char* value);
 #endif
 
 //=============================================================================
@@ -333,15 +349,19 @@ int DLLEXPORT swmm_start(int saveResults)
         report_writeOptions();
     }
 
-    // --- save saveResults flag to global variable
-    SaveResultsFlag = saveResults;
-    ExceptionCount = 0;
+        // --- save saveResults flag to global variable
+        SaveResultsFlag = saveResults;
+        ExceptionCount = 0;
 
 #ifdef EXH
     // --- begin exception handling loop here
     __try
 #endif
     {
+#ifdef BUILD_GPU
+        swmm_gpu_initialize_if_needed();
+#endif
+
         // --- initialize elapsed time in decimal days
         ElapsedTime = 0.0;
         RoutingDuration = TotalDuration;
@@ -374,6 +394,10 @@ int DLLEXPORT swmm_start(int saveResults)
         else DoRunoff = FALSE;
         if ( Nobjects[NODE] > 0 && !IgnoreRouting ) DoRouting = TRUE;
         else DoRouting = FALSE;
+
+#ifdef BUILD_GPU
+        swmm_gpu_configure_runtime();
+#endif
 
         // --- open binary output file
         output_open();
@@ -644,6 +668,9 @@ int DLLEXPORT swmm_end(void)
         if ( !IgnoreRainfall ) rain_close();
         if ( DoRunoff ) runoff_close();
         if ( DoRouting ) routing_close(RouteModel);
+#ifdef BUILD_GPU
+        swmm_gpu_log_summary();
+#endif
         hotstart_close();
         IsStartedFlag = FALSE;
     }
@@ -700,6 +727,11 @@ int DLLEXPORT swmm_close()
     }
     IsOpenFlag = FALSE;
     IsStartedFlag = FALSE;
+#ifdef BUILD_GPU
+    gpu_cleanup();
+    GpuInitAttempted = 0;
+    GpuUsageConfigured = 0;
+#endif
     return 0;
 }
 
@@ -958,6 +990,131 @@ void  DLLEXPORT swmm_decodeDate(double date, int *year, int *month, int *day,
     datetime_decodeTime(date, hour, minute, second);
     *dayOfWeek = datetime_dayOfWeek(date);
 }
+
+//=============================================================================
+#ifdef BUILD_GPU
+static void swmm_gpu_initialize_if_needed(void)
+{
+    if (GpuInitAttempted) return;
+    GpuInitAttempted = 1;
+
+    if (gpu_initialize() != 0) {
+        writecon("\n ... CUDA initialization failed; continuing with CPU routing.");
+    }
+}
+
+//=============================================================================
+
+static int swmm_gpu_parse_env(const char* value)
+{
+    if (value == NULL || value[0] == '\0') return -1;
+
+    char buffer[16];
+    size_t len = strlen(value);
+    if (len >= sizeof(buffer)) len = sizeof(buffer) - 1;
+    for (size_t i = 0; i < len; i++) {
+        buffer[i] = (char)tolower((unsigned char)value[i]);
+    }
+    buffer[len] = '\0';
+
+    if (strcmp(buffer, "1") == 0 ||
+        strcmp(buffer, "true") == 0 ||
+        strcmp(buffer, "on") == 0 ||
+        strcmp(buffer, "yes") == 0) {
+        return 1;
+    }
+
+    if (strcmp(buffer, "0") == 0 ||
+        strcmp(buffer, "false") == 0 ||
+        strcmp(buffer, "off") == 0 ||
+        strcmp(buffer, "no") == 0) {
+        return 0;
+    }
+
+    return -1;
+}
+
+//=============================================================================
+
+static void swmm_gpu_configure_runtime(void)
+{
+    if (GpuUsageConfigured) return;
+    GpuUsageConfigured = 1;
+
+    swmm_gpu_initialize_if_needed();
+    g_gpuConfig.useCuda = 0;
+
+    const char* envValue = getenv("SWMM_USE_CUDA");
+    int envSetting = swmm_gpu_parse_env(envValue);
+    char envSuffix[64] = "";
+    if (envValue && envValue[0]) {
+        snprintf(envSuffix, sizeof(envSuffix), " [SWMM_USE_CUDA=%s]", envValue);
+    }
+
+    const int hwReady = (g_gpuConfig.available && g_gpuConfig.enabled);
+    const int supportsRouting = (DoRouting && RouteModel == DW);
+    const int sizeOk =
+        (Nobjects[LINK] >= g_gpuConfig.minLinksForGPU &&
+         Nobjects[NODE] >= g_gpuConfig.minNodesForGPU);
+
+    char reason[192] = "";
+    if (envSetting == 0) {
+        snprintf(reason, sizeof(reason), "disabled via SWMM_USE_CUDA=0");
+    }
+    else if (!hwReady) {
+        snprintf(reason, sizeof(reason), "no CUDA-capable GPU detected");
+    }
+    else if (!supportsRouting) {
+        snprintf(reason, sizeof(reason),
+                 "CUDA path currently supports Dynamic Wave routing only");
+    }
+    else if (envSetting == 1) {
+        g_gpuConfig.useCuda = 1;
+    }
+    else if (sizeOk) {
+        g_gpuConfig.useCuda = 1;
+    }
+    else {
+        snprintf(reason, sizeof(reason),
+                 "model below CUDA threshold (links>=%d, nodes>=%d required; have %d/%d)",
+                 g_gpuConfig.minLinksForGPU, g_gpuConfig.minNodesForGPU,
+                 Nobjects[LINK], Nobjects[NODE]);
+    }
+
+    char msg[256];
+    if (g_gpuConfig.useCuda) {
+        gpu_profiler_reset();
+        snprintf(msg, sizeof(msg),
+                 "\n ... CUDA acceleration enabled%s (device %d, compute %d.%d, unified memory: %s)",
+                 envSuffix,
+                 g_gpuConfig.activeDevice,
+                 g_gpuConfig.computeCapability / 10,
+                 g_gpuConfig.computeCapability % 10,
+                 g_gpuConfig.unifiedMemory ? "yes" : "no");
+    }
+    else {
+        if (reason[0] == '\0') {
+            snprintf(reason, sizeof(reason), "not requested");
+        }
+        int maxReasonLen = (int)sizeof(reason) - 1;
+        if (maxReasonLen > 200) maxReasonLen = 200;
+        snprintf(msg, sizeof(msg),
+                 "\n ... CUDA acceleration disabled%s (%.*s)",
+                 envSuffix,
+                 maxReasonLen,
+                 reason);
+    }
+    writecon(msg);
+}
+
+//=============================================================================
+
+static void swmm_gpu_log_summary(void)
+{
+    if (!g_gpuConfig.useCuda) return;
+    gpu_profiler_printSummary();
+}
+#endif
 
 //=============================================================================
 //   Object property getters and setters

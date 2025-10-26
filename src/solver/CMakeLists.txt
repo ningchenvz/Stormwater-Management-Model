@@ -94,6 +94,13 @@ target_include_directories(swmm5
         $<$<BOOL:${BUILD_GPU}>:${CMAKE_CURRENT_SOURCE_DIR}/gpu>
 )
 
+if(BUILD_GPU AND DEFINED CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
+    target_include_directories(swmm5
+        PRIVATE
+            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    )
+endif()
+
 install(TARGETS swmm5 EXPORT swmm5Targets
     RUNTIME    DESTINATION "${TOOL_DIST}"
     LIBRARY    DESTINATION "${TOOL_DIST}"

@@ -17,7 +17,19 @@ endif()
 
 
 # Check for GPU support option before project definition
-option(BUILD_GPU "Enable GPU acceleration with CUDA" OFF)
+option(ENABLE_CUDA "Enable GPU acceleration with CUDA" OFF)
+
+# Backwards compatibility with legacy BUILD_GPU flag
+if(DEFINED BUILD_GPU)
+    message(WARNING "BUILD_GPU is deprecated; use ENABLE_CUDA instead.")
+    if(BUILD_GPU)
+        set(ENABLE_CUDA ON CACHE BOOL "Enable GPU acceleration with CUDA" FORCE)
+    else()
+        set(ENABLE_CUDA OFF CACHE BOOL "Enable GPU acceleration with CUDA" FORCE)
+    endif()
+endif()
+
+set(BUILD_GPU ${ENABLE_CUDA})
 
 # Determine languages based on BUILD_GPU option
 if(BUILD_GPU)

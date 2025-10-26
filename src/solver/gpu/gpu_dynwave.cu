@@ -16,6 +16,11 @@
 #include "gpu_structures.h"
 #include "gpu_dynwave_kernels.cuh"
 
+extern "C" {
+#include "headers.h"
+#include "dynwave_data.h"
+}
+
 //=============================================================================
 // Kernel: Find Node Depths
 //=============================================================================
@@ -73,7 +78,7 @@ __global__ void kernel_findNodeDepths(
         nodes->inflow[i],
         nodes->outflow[i],
         nodes->fullVolume[i],
-        nodes->degree[i]
+        nodes->degree[i],
         // Xnode data
         nodes->newSurfArea[i],
         nodes->oldSurfArea[i],
@@ -92,6 +97,7 @@ __global__ void kernel_findNodeDepths(
     nodes->newVolume[i] = newVolume;
     nodes->overflow[i] = overflow;
     nodes->oldSurfArea[i] = oldSurfArea;
+    nodes->dYdT[i] = dYdT;
 
     // Check convergence
     double depthChange = fabs(newDepth - yOld);
@@ -144,3 +150,142 @@ int gpu_computeNodeDepths(
 }
 
 } // extern "C"
+
+typedef struct
+{
+    GPU_NodeData data;
+    int nodeCapacity;
+    int initialized;
+} NodeKernelContext;
+
+static NodeKernelContext g_nodeKernelCtx = {0};
+static cudaEvent_t g_nodeKernelStartEvent = nullptr;
+static cudaEvent_t g_nodeKernelStopEvent = nullptr;
+static int g_nodeKernelEventsInitialized = 0;
+
+static int ensureNodeKernelContext(void)
+{
+    if (!g_gpuConfig.unifiedMemory) {
+        return -1;
+    }
+
+    int nodeCount = Nobjects[NODE];
+    if (nodeCount <= 0) return -1;
+
+    if (!g_nodeKernelCtx.initialized ||
+        nodeCount != g_nodeKernelCtx.nodeCapacity)
+    {
+        if (g_nodeKernelCtx.initialized) {
+            gpu_freeNodeData(&g_nodeKernelCtx.data);
+            g_nodeKernelCtx.initialized = 0;
+        }
+        if (gpu_allocateNodeData(&g_nodeKernelCtx.data, nodeCount) != 0) {
+            return -1;
+        }
+        g_nodeKernelCtx.nodeCapacity = nodeCount;
+        g_nodeKernelCtx.initialized = 1;
+    }
+
+    if (!g_nodeKernelEventsInitialized) {
+        cudaEventCreateWithFlags(&g_nodeKernelStartEvent, cudaEventDefault);
+        cudaEventCreateWithFlags(&g_nodeKernelStopEvent, cudaEventDefault);
+        g_nodeKernelEventsInitialized = 1;
+    }
+
+    return 0;
+}
+
+static void copyNodesToGpu(GPU_NodeData* nodes)
+{
+    int count = nodes->count;
+    for (int i = 0; i < count; i++)
+    {
+        nodes->type[i]        = Node[i].type;
+        nodes->invertElev[i]  = Node[i].invertElev;
+        nodes->fullDepth[i]   = Node[i].fullDepth;
+        nodes->surDepth[i]    = Node[i].surDepth;
+        nodes->pondedArea[i]  = Node[i].pondedArea;
+        nodes->crownElev[i]   = Node[i].crownElev;
+        nodes->oldDepth[i]    = Node[i].oldDepth;
+        nodes->newDepth[i]    = Node[i].newDepth;
+        nodes->oldVolume[i]   = Node[i].oldVolume;
+        nodes->newVolume[i]   = Node[i].newVolume;
+        nodes->fullVolume[i]  = Node[i].fullVolume;
+        nodes->oldNetInflow[i]= Node[i].oldNetInflow;
+        nodes->inflow[i]      = Node[i].inflow;
+        nodes->outflow[i]     = Node[i].outflow;
+        nodes->overflow[i]    = Node[i].overflow;
+        nodes->degree[i]      = Node[i].degree;
+        nodes->converged[i]   = Xnode[i].converged;
+        nodes->newSurfArea[i] = Xnode[i].newSurfArea;
+        nodes->oldSurfArea[i] = Xnode[i].oldSurfArea;
+        nodes->sumdqdh[i]     = Xnode[i].sumdqdh;
+        nodes->dYdT[i]        = Xnode[i].dYdT;
+    }
+}
+
+static void copyNodesFromGpu(GPU_NodeData* nodes)
+{
+    int count = nodes->count;
+    for (int i = 0; i < count; i++)
+    {
+        if (Node[i].type != OUTFALL)
+        {
+            Node[i].newDepth  = nodes->newDepth[i];
+            Node[i].newVolume = nodes->newVolume[i];
+            Node[i].overflow  = nodes->overflow[i];
+        }
+        Xnode[i].converged = nodes->converged[i];
+        Xnode[i].newSurfArea = nodes->newSurfArea[i];
+        Xnode[i].oldSurfArea = nodes->oldSurfArea[i];
+        Xnode[i].sumdqdh     = nodes->sumdqdh[i];
+        Xnode[i].dYdT        = nodes->dYdT[i];
+    }
+}
+
+extern "C" int gpu_runNodeDepthKernel(
+    double dt,
+    int allowPonding,
+    int surchargeMethod,
+    double minSurfArea,
+    int steps,
+    double omega,
+    double headTol)
+//
+//  Purpose: Copies SWMM node state to GPU, runs the node depth kernel,
+//           and copies results back. Returns converged node count or -1 on failure.
+//
+{
+    if (ensureNodeKernelContext() != 0) {
+        return -1;
+    }
+
+    GPU_NodeData* nodes = &g_nodeKernelCtx.data;
+    copyNodesToGpu(nodes);
+
+    int convergedCount = 0;
+    cudaEventRecord(g_nodeKernelStartEvent, 0);
+    if (gpu_computeNodeDepths(
+            nodes,
+            dt,
+            allowPonding,
+            surchargeMethod,
+            minSurfArea,
+            steps,
+            omega,
+            headTol,
+            &convergedCount) != 0)
+    {
+        return -1;
+    }
+    cudaEventRecord(g_nodeKernelStopEvent, 0);
+    cudaEventSynchronize(g_nodeKernelStopEvent);
+
+    float elapsedMs = 0.0f;
+    cudaEventElapsedTime(&elapsedMs, g_nodeKernelStartEvent, g_nodeKernelStopEvent);
+    gpu_profiler_addKernelTime((double)elapsedMs);
+
+    copyNodesFromGpu(nodes);
+
+    return convergedCount;
+}
