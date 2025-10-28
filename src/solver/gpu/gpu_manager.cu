@@ -26,6 +26,18 @@ GPU_LinkData g_gpuLinks = {0};
 GPU_ConduitData g_gpuConduits = {0};
 GPU_XsectData g_gpuXsects = {0};
 
+// Global GPU data structures for non-conduit links
+GPU_PumpData g_gpuPumps = {0};
+GPU_OrificeData g_gpuOrifices = {0};
+GPU_WeirData g_gpuWeirs = {0};
+GPU_OutletData g_gpuOutlets = {0};
+
+// Global GPU curve data (for pumps and outlets)
+GPU_CurveData g_gpuCurves = {0};
+GPU_CurvePoints g_gpuCurvePoints = {0};
+
+static cudaStream_t g_gpuStream = 0;
+
 //=============================================================================
 
 int gpu_initialize(void)
@@ -100,10 +112,19 @@ int gpu_initialize(void)
     g_gpuConfig.available = 1;
     g_gpuConfig.enabled = 1;
     g_gpuConfig.useCuda = 0;
+    g_gpuConfig.forceCuda = 0;
+    g_gpuConfig.maxKernelTimeMs = GPU_MAX_KERNEL_MS_DEFAULT;
+    g_gpuConfig.maxTotalKernelTimeMs = GPU_MAX_TOTAL_KERNEL_MS_DEFAULT;
+
+    if (!g_gpuStream)
+    {
+        cudaStreamCreateWithFlags(&g_gpuStream, cudaStreamNonBlocking);
+    }
 
     // Set default thresholds
     g_gpuConfig.minLinksForGPU = GPU_MIN_LINKS_DEFAULT;
     g_gpuConfig.minNodesForGPU = GPU_MIN_NODES_DEFAULT;
+    g_gpuConfig.minConduitsForGPU = GPU_MIN_CONDUITS_DEFAULT;
     gpu_profiler_reset();
 
     printf("\n... GPU Initialized: %s\n", prop.name);
@@ -117,8 +138,15 @@ int gpu_initialize(void)
     if (g_gpuConfig.unifiedMemory && g_gpuConfig.concurrentManagedAccess) {
         printf("... Concurrent Managed Access: Enabled (optimal for CPU/GPU interleaving)\n");
     }
+    printf("... GPU failover threshold: %.1f ms per iteration (%.1f ms total)\n",
+           g_gpuConfig.maxKernelTimeMs, g_gpuConfig.maxTotalKernelTimeMs);
 
     return cudaSuccess;
+}
+
+cudaStream_t gpu_getStream(void)
+{
+    return g_gpuStream;
 }
 
 //=============================================================================
@@ -129,6 +157,10 @@ void gpu_cleanup(void)
 //
 {
     if (g_gpuConfig.available) {
+        if (g_gpuStream) {
+            cudaStreamDestroy(g_gpuStream);
+            g_gpuStream = 0;
+        }
         cudaDeviceReset();
         g_gpuConfig.available = 0;
         g_gpuConfig.enabled = 0;
@@ -194,6 +226,7 @@ void gpu_printInfo(void)
     printf("  Concurrent Access: %s\n", g_gpuConfig.concurrentManagedAccess ? "Yes" : "No");
     printf("  GPU Min Links: %d\n", g_gpuConfig.minLinksForGPU);
     printf("  GPU Min Nodes: %d\n", g_gpuConfig.minNodesForGPU);
+    printf("  GPU Min Conduits: %d\n", g_gpuConfig.minConduitsForGPU);
 }
 
 //=============================================================================
@@ -233,4 +266,244 @@ void gpu_profiler_printSummary(void)
            g_gpuPerfStats.kernelLaunches, g_gpuPerfStats.kernelTimeMs);
     printf("    Memcpy/prefetch : %6d  (%.3f ms total)\n",
            g_gpuPerfStats.memcpyCalls, g_gpuPerfStats.memcpyTimeMs);
+}
+
+//=============================================================================
+// Non-Conduit Link GPU Initialization
+//=============================================================================
+
+extern "C" {
+#include "headers.h"
+}
+
+extern "C" int gpu_initializeNonConduitData(void)
+//
+//  Purpose: Initialize GPU data structures for non-conduit links
+//           (pumps, orifices, weirs, outlets) and curves
+//  Returns: 0 if successful, error code otherwise
+//
+//  This function:
+//   1. Converts CPU Curve[] (linked lists) to GPU SoA format
+//   2. Allocates and initializes pump/orifice/weir/outlet data
+//   3. Transfers all data to GPU
+//
+{
+    printf("\n  Initializing non-conduit GPU data...\n");
+
+    // Step 1: Convert Curves from linked list to SoA format
+    int numCurves = Nobjects[CURVE];
+    if (numCurves > 0) {
+        // Count total curve points
+        int totalPoints = 0;
+        for (int i = 0; i < numCurves; i++) {
+            TTableEntry* entry = Curve[i].firstEntry;
+            while (entry) {
+                totalPoints++;
+                entry = entry->next;
+            }
+        }
+
+        printf("    Converting %d curves (%d total points) to GPU format...\n",
+               numCurves, totalPoints);
+
+        // Allocate GPU curve structures
+        if (gpu_allocateCurveData(&g_gpuCurves, numCurves) != 0) {
+            fprintf(stderr, "    ERROR: Failed to allocate GPU curve data\n");
+            return -1;
+        }
+
+        if (gpu_allocateCurvePoints(&g_gpuCurvePoints, totalPoints) != 0) {
+            fprintf(stderr, "    ERROR: Failed to allocate GPU curve points\n");
+            return -1;
+        }
+
+        // Fill curve metadata and flatten points
+        int pointOffset = 0;
+        for (int i = 0; i < numCurves; i++) {
+            g_gpuCurves.h_curveType[i] = Curve[i].curveType;
+            g_gpuCurves.h_dxMin[i] = Curve[i].dxMin;
+            g_gpuCurves.h_dataStart[i] = pointOffset;
+
+            // Count and copy points for this curve
+            int curvePointCount = 0;
+            TTableEntry* entry = Curve[i].firstEntry;
+            while (entry) {
+                g_gpuCurvePoints.h_xValues[pointOffset + curvePointCount] = entry->x;
+                g_gpuCurvePoints.h_yValues[pointOffset + curvePointCount] = entry->y;
+                curvePointCount++;
+                entry = entry->next;
+            }
+
+            g_gpuCurves.h_dataCount[i] = curvePointCount;
+            pointOffset += curvePointCount;
+        }
+
+        // Transfer curves to GPU
+        if (gpu_transferCurveDataToDevice(&g_gpuCurves) != 0 ||
+            gpu_transferCurvePointsToDevice(&g_gpuCurvePoints) != 0) {
+            fprintf(stderr, "    ERROR: Failed to transfer curve data to GPU\n");
+            return -1;
+        }
+
+        printf("    Curves transferred to GPU successfully\n");
+    }
+
+    // Step 2: Initialize Pump Data
+    int numPumps = Nlinks[PUMP];
+    if (numPumps > 0) {
+        printf("    Initializing %d pumps...\n", numPumps);
+
+        if (gpu_allocatePumpData(&g_gpuPumps, numPumps) != 0) {
+            fprintf(stderr, "    ERROR: Failed to allocate GPU pump data\n");
+            return -1;
+        }
+
+        // Find link indices for each pump (reverse map: pump k → link j)
+        for (int j = 0; j < Nobjects[LINK]; j++) {
+            if (Link[j].type == PUMP) {
+                int k = Link[j].subIndex;
+                g_gpuPumps.h_linkIndex[k] = j;
+            }
+        }
+
+        for (int i = 0; i < numPumps; i++) {
+            g_gpuPumps.h_type[i] = Pump[i].type;
+            g_gpuPumps.h_pumpCurve[i] = Pump[i].pumpCurve;
+            g_gpuPumps.h_initSetting[i] = Pump[i].initSetting;
+            g_gpuPumps.h_yOn[i] = Pump[i].yOn;
+            g_gpuPumps.h_yOff[i] = Pump[i].yOff;
+            g_gpuPumps.h_xMin[i] = Pump[i].xMin;
+            g_gpuPumps.h_xMax[i] = Pump[i].xMax;
+        }
+
+        if (gpu_transferPumpStaticToDevice(&g_gpuPumps, numPumps) != 0) {
+            fprintf(stderr, "    ERROR: Failed to transfer pump data to GPU\n");
+            return -1;
+        }
+    }
+
+    // Step 3: Initialize Orifice Data
+    int numOrifices = Nlinks[ORIFICE];
+    if (numOrifices > 0) {
+        printf("    Initializing %d orifices...\n", numOrifices);
+
+        if (gpu_allocateOrificeData(&g_gpuOrifices, numOrifices) != 0) {
+            fprintf(stderr, "    ERROR: Failed to allocate GPU orifice data\n");
+            return -1;
+        }
+
+        // Find link indices for each orifice (reverse map: orifice k → link j)
+        for (int j = 0; j < Nobjects[LINK]; j++) {
+            if (Link[j].type == ORIFICE) {
+                int k = Link[j].subIndex;
+                g_gpuOrifices.h_linkIndex[k] = j;
+            }
+        }
+
+        for (int i = 0; i < numOrifices; i++) {
+            g_gpuOrifices.h_type[i] = Orifice[i].type;
+            g_gpuOrifices.h_shape[i] = Orifice[i].shape;
+            g_gpuOrifices.h_cDisch[i] = Orifice[i].cDisch;
+            g_gpuOrifices.h_orate[i] = Orifice[i].orate;
+            g_gpuOrifices.h_cOrif[i] = Orifice[i].cOrif;
+            g_gpuOrifices.h_hCrit[i] = Orifice[i].hCrit;
+            g_gpuOrifices.h_cWeir[i] = Orifice[i].cWeir;
+            g_gpuOrifices.h_length[i] = Orifice[i].length;
+            g_gpuOrifices.h_surfArea[i] = Orifice[i].surfArea;
+        }
+
+        if (gpu_transferOrificeStaticToDevice(&g_gpuOrifices, numOrifices) != 0) {
+            fprintf(stderr, "    ERROR: Failed to transfer orifice data to GPU\n");
+            return -1;
+        }
+    }
+
+    // Step 4: Initialize Weir Data
+    int numWeirs = Nlinks[WEIR];
+    if (numWeirs > 0) {
+        printf("    Initializing %d weirs...\n", numWeirs);
+
+        if (gpu_allocateWeirData(&g_gpuWeirs, numWeirs) != 0) {
+            fprintf(stderr, "    ERROR: Failed to allocate GPU weir data\n");
+            return -1;
+        }
+
+        // Find link indices for each weir (reverse map: weir k → link j)
+        for (int j = 0; j < Nobjects[LINK]; j++) {
+            if (Link[j].type == WEIR) {
+                int k = Link[j].subIndex;
+                g_gpuWeirs.h_linkIndex[k] = j;
+            }
+        }
+
+        for (int i = 0; i < numWeirs; i++) {
+            g_gpuWeirs.h_type[i] = Weir[i].type;
+            g_gpuWeirs.h_cDisch1[i] = Weir[i].cDisch1;
+            g_gpuWeirs.h_cDisch2[i] = Weir[i].cDisch2;
+            g_gpuWeirs.h_endCon[i] = Weir[i].endCon;
+            g_gpuWeirs.h_canSurcharge[i] = Weir[i].canSurcharge;
+            g_gpuWeirs.h_roadWidth[i] = Weir[i].roadWidth;
+            g_gpuWeirs.h_roadSurface[i] = Weir[i].roadSurface;
+            g_gpuWeirs.h_cdCurve[i] = Weir[i].cdCurve;
+            g_gpuWeirs.h_cSurcharge[i] = Weir[i].cSurcharge;
+            g_gpuWeirs.h_length[i] = Weir[i].length;
+            g_gpuWeirs.h_slope[i] = Weir[i].slope;
+            g_gpuWeirs.h_surfArea[i] = Weir[i].surfArea;
+        }
+
+        if (gpu_transferWeirStaticToDevice(&g_gpuWeirs, numWeirs) != 0) {
+            fprintf(stderr, "    ERROR: Failed to transfer weir data to GPU\n");
+            return -1;
+        }
+    }
+
+    // Step 5: Initialize Outlet Data
+    int numOutlets = Nlinks[OUTLET];
+    if (numOutlets > 0) {
+        printf("    Initializing %d outlets...\n", numOutlets);
+
+        if (gpu_allocateOutletData(&g_gpuOutlets, numOutlets) != 0) {
+            fprintf(stderr, "    ERROR: Failed to allocate GPU outlet data\n");
+            return -1;
+        }
+
+        // Find link indices for each outlet (reverse map: outlet k → link j)
+        for (int j = 0; j < Nobjects[LINK]; j++) {
+            if (Link[j].type == OUTLET) {
+                int k = Link[j].subIndex;
+                g_gpuOutlets.h_linkIndex[k] = j;
+            }
+        }
+
+        for (int i = 0; i < numOutlets; i++) {
+            g_gpuOutlets.h_qCoeff[i] = Outlet[i].qCoeff;
+            g_gpuOutlets.h_qExpon[i] = Outlet[i].qExpon;
+            g_gpuOutlets.h_qCurve[i] = Outlet[i].qCurve;
+            g_gpuOutlets.h_curveType[i] = Outlet[i].curveType;
+        }
+
+        if (gpu_transferOutletStaticToDevice(&g_gpuOutlets, numOutlets) != 0) {
+            fprintf(stderr, "    ERROR: Failed to transfer outlet data to GPU\n");
+            return -1;
+        }
+    }
+
+    printf("  Non-conduit GPU initialization complete!\n");
+    printf("    Pumps: %d, Orifices: %d, Weirs: %d, Outlets: %d\n",
+           numPumps, numOrifices, numWeirs, numOutlets);
+
+    return 0;
+}
+
+extern "C" void gpu_freeNonConduitData(void)
+//
+//  Purpose: Free GPU memory for non-conduit link data
+//
+{
+    gpu_freeCurveData(&g_gpuCurves);
+    gpu_freeCurvePoints(&g_gpuCurvePoints);
+    gpu_freePumpData(&g_gpuPumps);
+    gpu_freeOrificeData(&g_gpuOrifices);
+    gpu_freeWeirData(&g_gpuWeirs);
+    gpu_freeOutletData(&g_gpuOutlets);
 }
