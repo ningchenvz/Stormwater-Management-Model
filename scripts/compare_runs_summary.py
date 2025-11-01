@@ -13,9 +13,10 @@ from typing import List, Tuple
 
 OUTPUT_DIR_RE = re.compile(r"^Output folder\s*:\s*(.+)$")
 ARTIFACT_RE = re.compile(r"^Artifacts written to:\s*(.+)$")
-REPORT_RE = re.compile(r"^Reports\s+(match|differ)(?:.*?(?:see|at)\s+([^)]*))?", re.IGNORECASE)
-COMPLETED_RE = re.compile(r"completed in\s+([0-9.]+)\s+seconds", re.IGNORECASE)
+REPORT_RE = re.compile(r"^Reports\s+(match|differ(?:\s*-\s*(MINOR|MAJOR)\s+differences)?)(?:.*?(?:see|at)\s+([^)]*))?", re.IGNORECASE)
+COMPLETED_RE = re.compile(r"completed in\s+([0-9.]+)\s+ms", re.IGNORECASE)
 BINARY_RE = re.compile(r"^Binary outputs\s+(match|differ)", re.IGNORECASE)
+MODEL_INFO_RE = re.compile(r"^Model info\s*:\s*(\d+)\s+links,\s*(.+?)\s+simulation", re.IGNORECASE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,8 +47,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def collect_inp_files(root: Path, recursive: bool) -> List[Path]:
-    pattern = "**/*.inp" if recursive else "*.inp"
-    return sorted(root.glob(pattern))
+    """Collect all .inp files (case-insensitive) from the given directory."""
+    # Use glob to get all files, then filter by extension (case-insensitive)
+    if recursive:
+        all_files = root.rglob("*")
+    else:
+        all_files = root.glob("*")
+
+    # Filter for .inp extension (case-insensitive)
+    inp_files = [f for f in all_files if f.is_file() and f.suffix.lower() == ".inp"]
+
+    return sorted(inp_files)
 
 
 def run_compare_script(
@@ -76,6 +86,8 @@ def extract_summary(output: str):
     binary_status = "n/a"
     gpu_time = "n/a"
     cpu_time = "n/a"
+    total_links = "n/a"
+    sim_duration = "n/a"
     current_mode = None
 
     for line in lines:
@@ -90,13 +102,28 @@ def extract_summary(output: str):
         if report_status == "n/a":
             match = REPORT_RE.match(line)
             if match:
-                report_status = match.group(1).lower()
-                if match.group(2):
-                    report_path = match.group(2).strip()
+                base_status = match.group(1).lower()
+                severity = match.group(2)  # MINOR or MAJOR
+                path_group = match.group(3)
+
+                if "differ" in base_status and severity:
+                    report_status = severity.lower()  # "minor" or "major"
+                elif "match" in base_status:
+                    report_status = "match"
+                else:
+                    report_status = "differ"
+
+                if path_group:
+                    report_path = path_group.strip()
         if binary_status == "n/a":
             match = BINARY_RE.match(line)
             if match:
                 binary_status = match.group(1).lower()
+        if total_links == "n/a":
+            match = MODEL_INFO_RE.match(line)
+            if match:
+                total_links = match.group(1)
+                sim_duration = match.group(2).strip()
         if line.startswith("==> Running "):
             if "GPU" in line.upper():
                 current_mode = "gpu"
@@ -125,6 +152,8 @@ def extract_summary(output: str):
         "binary_status": binary_status,
         "gpu_time": gpu_time,
         "cpu_time": cpu_time,
+        "total_links": total_links,
+        "sim_duration": sim_duration,
     }
 
 
@@ -165,9 +194,9 @@ def main():
 
     inp_files = collect_inp_files(target_dir, recursive=not args.non_recursive)
     if not inp_files:
-        sys.exit(f"No .inp files found under {target_dir}")
+        sys.exit(f"No .inp/.INP files found under {target_dir}")
 
-    summary_rows: List[Tuple[str, str, str, str, str]] = []
+    summary_rows: List[Tuple[str, str, str, str, str, str, str]] = []
     diff_rows: List[Tuple[str, str]] = []
     any_failures = False
     total = len(inp_files)
@@ -180,7 +209,7 @@ def main():
         if code != 0:
             any_failures = True
             print(output, file=sys.stderr)
-            summary_rows.append((inp.name, "error", "error", "n/a", "n/a"))
+            summary_rows.append((inp.name, "error", "error", "n/a", "n/a", "n/a", "n/a"))
             continue
 
         summary = extract_summary(output)
@@ -188,12 +217,22 @@ def main():
         if summary["report_path"]:
             diff_rows.append((Path(summary["report_path"]).name, summary["report_path"]))
         binary_cell = summary["binary_status"]
-        summary_rows.append((inp.name, report_cell, binary_cell, summary["gpu_time"], summary["cpu_time"]))
+        summary_rows.append((inp.name, report_cell, binary_cell,
+                           summary["total_links"], summary["sim_duration"],
+                           summary["gpu_time"], summary["cpu_time"]))
 
-    print("\nSummary:\n")
+        print("\nCurrent Summary:\n")
+        print(
+            format_table(
+                ("Input", "Report Diff", "Binary Diff", "Links", "Duration", "GPU Time (ms)", "CPU Time (ms)"),
+                summary_rows,
+            )
+        )
+
+    print("\nFinal Summary:\n")
     print(
         format_table(
-            ("Input", "Report Diff", "Binary Diff", "GPU Time (s)", "CPU Time (s)"),
+            ("Input", "Report Diff", "Binary Diff", "Links", "Duration", "GPU Time (ms)", "CPU Time (ms)"),
             summary_rows,
         )
     )

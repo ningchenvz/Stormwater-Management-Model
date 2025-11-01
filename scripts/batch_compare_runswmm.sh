@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run GPU/CPU comparisons for every .inp file within a directory.
+# Run GPU/CPU comparisons for every .inp/.INP file within a directory.
 
 set -euo pipefail
 
@@ -33,10 +33,10 @@ COMPARE_SCRIPT=${COMPARE_SCRIPT:-${SCRIPT_DIR}/compare_runswmm_gpu_cpu.sh}
 echo "Batch compare directory : $TARGET_DIR"
 echo "Compare script          : $COMPARE_SCRIPT"
 
-mapfile -t INP_FILES < <(find "$TARGET_DIR" -type f -name '*.inp' | sort)
+mapfile -t INP_FILES < <(find "$TARGET_DIR" -type f \( -iname '*.inp' \) | sort)
 
 if [ ${#INP_FILES[@]} -eq 0 ]; then
-    die "no .inp files found under $TARGET_DIR"
+    die "no .inp/.INP files found under $TARGET_DIR"
 fi
 
 failed=0
