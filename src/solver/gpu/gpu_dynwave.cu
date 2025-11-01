@@ -65,6 +65,11 @@ __global__ void kernel_findNodeDepths(
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
+    // DEBUG: Print dt value from first thread, first few iterations
+    if (i == 0 && steps < 3) {
+        printf("GPU kernel_findNodeDepths: dt = %.6f, steps = %d\n", dt, steps);
+    }
+
     if (i >= nodes->count) return;
 
     // Skip outfall nodes (handled separately on CPU)

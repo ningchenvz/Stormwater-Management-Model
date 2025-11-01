@@ -473,4 +473,135 @@ void gpu_findNonConduitSurfArea(
     }
 }
 
+//=============================================================================
+// NODE OUTFLOW LIMITING
+//=============================================================================
+
+//-----------------------------------------------------------------------------
+// Device Helper: Get Maximum Outflow from Node
+//-----------------------------------------------------------------------------
+// Equivalent to node_getMaxOutflow() in node.c:418
+// Limits outflow rate from a node with storage volume to prevent draining
+//
+__device__ __forceinline__
+double gpu_node_getMaxOutflow(
+    int j,                       // node index
+    double q,                    // original outflow rate
+    double qPrelim,              // NOT USED in new approach - kept for compatibility
+    double tStep,                // time step
+    const double* d_nodeInflow,
+    const double* d_nodeOutflow, // Now contains ONLY conduit flows (pumps not yet added)
+    const double* d_nodeOldVolume,
+    const double* d_nodeFullVolume)
+{
+    double qMax;
+    double qOrig = q;
+
+    // If node has storage volume, limit outflow
+    if (d_nodeFullVolume[j] > 0.0) {
+        // NEW APPROACH: Phase 1b no longer adds pump flows to d_nodeOutflow
+        // So d_nodeOutflow[j] contains ONLY conduit outflows (matching CPU behavior)
+        // We can use the same formula as CPU without any adjustments!
+        qMax = d_nodeInflow[j] + d_nodeOldVolume[j] / tStep;
+
+        if (q > qMax) {
+            q = qMax;
+            printf("  getMaxOutflow: node=%d limited q from %.6f to %.6f (qMax=%.6f, inflow=%.6f, oldVol=%.6f, tStep=%.6f)\n",
+                   j, qOrig, q, qMax, d_nodeInflow[j], d_nodeOldVolume[j], tStep);
+        }
+    }
+
+    return fmax(0.0, q);
+}
+
+//=============================================================================
+// PUMP FLOW MODIFICATION
+//=============================================================================
+
+//-----------------------------------------------------------------------------
+// Device Helper: Get Modified Pump Flow
+//-----------------------------------------------------------------------------
+// Equivalent to getModPumpFlow() in dynwave.c:601
+// Modifies pump curve pumping rate depending on amount of water available
+// at pump's inlet node to prevent draining the node dry
+//
+__device__ __forceinline__
+double gpu_getModPumpFlow(
+    int pumpIdx,                 // pump index
+    int j,                       // inlet node index
+    double q,                    // pump flow from pump curve (final, may differ from prelim)
+    double qPrelim,              // preliminary flow added to nodes in Phase 1b
+    double dt,                   // time step
+    int pumpType,                // pump type
+    const int* d_nodeType,
+    const double* d_nodeInflow,
+    const double* d_nodeOutflow, // NOTE: includes qPrelim from Phase 1b!
+    const double* d_nodeOldDepth,
+    const double* d_nodeOldNetInflow,
+    const double* d_nodeOldVolume,
+    const double* d_nodeFullVolume,
+    const double* d_nodeSurfArea)
+{
+    // DEBUG: Entry logging for first few pumps
+    if (pumpIdx < 3) {
+        printf("getModPumpFlow pump=%d type=%d q=%.6f qPrelim=%.6f\n",
+               pumpIdx, pumpType, q, qPrelim);
+    }
+
+    if (q == 0.0) {
+        if (pumpIdx < 3) printf("  --> q=0, returning 0\n");
+        return q;
+    }
+
+    // Case 1: Inlet node is a storage node
+    // Prevent node volume from going negative
+    if (d_nodeType[j] == STORAGE) {
+        if (pumpIdx < 3) printf("  --> Storage node, calling getMaxOutflow\n");
+        return gpu_node_getMaxOutflow(j, q, qPrelim, dt, d_nodeInflow, d_nodeOutflow,
+                                     d_nodeOldVolume, d_nodeFullVolume);
+    }
+
+    // Case 2: Inlet is a non-storage node
+    switch (pumpType) {
+        case 0: // TYPE1_PUMP - volume-based, so limit outflow
+            if (pumpIdx < 3) printf("  --> TYPE1_PUMP, calling getMaxOutflow\n");
+            return gpu_node_getMaxOutflow(j, q, qPrelim, dt, d_nodeInflow, d_nodeOutflow,
+                                         d_nodeOldVolume, d_nodeFullVolume);
+
+        case 1: // TYPE2_PUMP (depth curve, discrete)
+        case 3: // TYPE4_PUMP (depth curve, continuous)
+        case 2: // TYPE3_PUMP (head curve, continuous)
+        {
+            // CRITICAL: d_nodeOutflow[j] already includes qPrelim from Phase 1b
+            // Subtract qPrelim to get outflow from other links, then add q to test final flow
+            double netOutflowWithoutThisPump = d_nodeOutflow[j] - qPrelim;
+            double newNetInflow = d_nodeInflow[j] - netOutflowWithoutThisPump - q;
+            double netFlowVolume = 0.5 * (d_nodeOldNetInflow[j] + newNetInflow) * dt;
+            double y = d_nodeOldDepth[j] + netFlowVolume / d_nodeSurfArea[j];
+
+            // DEBUG: Log calculation details for first few pumps
+            if (pumpIdx < 3) {
+                printf("Pump %d: inflow=%.6f outflow=%.6f qPrelim=%.6f q=%.6f\n",
+                       pumpIdx, d_nodeInflow[j], d_nodeOutflow[j], qPrelim, q);
+                printf("  netOutflowWithout=%.6f newNetInflow=%.6f oldDepth=%.6f y=%.6f\n",
+                       netOutflowWithoutThisPump, newNetInflow, d_nodeOldDepth[j], y);
+            }
+
+            // If depth would go negative, limit flow to node inflow
+            if (y <= 0.0) {
+                if (pumpIdx < 3) {
+                    printf("  --> Depth would go negative! Limiting flow to inflow\n");
+                }
+                return d_nodeInflow[j];
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    return q;
+}
+
 #endif // GPU_NONCONDUIT_HELPERS_CUH

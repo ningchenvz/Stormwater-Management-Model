@@ -290,58 +290,43 @@ int dynwave_execute(double tStep)
     Omega = OMEGA;
     initRoutingStep();
 
-#ifdef BUILD_GPU
-    // --- GPU-accelerated path: Persistent Picard iteration
-    //     Keeps convergence checking on GPU to minimize CPU-GPU transfers
-    //     Expected speedup: 2-5x for Picard iterations
-    if ( g_gpuConfig.useCuda )
-    {
-        int gpuIterations = 0;
-        int gpuConverged = 0;
-
-        // Initialize node states once before GPU Picard loop
-        initNodeStates();
-
-        // Run link flows on CPU first (GPU link flows not yet implemented)
-        findLinkFlows(tStep);
-
-        // Execute entire Picard iteration loop on GPU
-        int gpuResult = gpu_runPersistentPicardIteration(
-            tStep,
-            AllowPonding,
-            SurchargeMethod,
-            MinSurfArea,
-            Omega,
-            HeadTol,
-            MaxTrials,
-            &gpuIterations,
-            &gpuConverged);
-
-        if ( gpuResult == 0 )
-        {
-            // GPU path succeeded
-            Steps = gpuIterations;
-            converged = gpuConverged;
-
-            if ( !converged ) updateConvergenceStats();
-
-            // Skip CPU Picard loop - already done on GPU
-            goto gpu_path_complete;
-        }
-        else
-        {
-            // GPU path failed - fall back to CPU
-            printf("WARNING: GPU Picard iteration failed, falling back to CPU\n");
+    // --- DEBUG: Log node states for mass balance tracking
+    static FILE* massBalanceLog = NULL;
+    static int routingStepCount = 0;
+    if (routingStepCount < 20 && g_gpuConfig.useCuda) {  // First 20 routing steps
+        if (massBalanceLog == NULL) {
+            massBalanceLog = fopen("/tmp/gpu_mass_balance.txt", "w");
+            if (massBalanceLog) {
+                fprintf(massBalanceLog, "# Mass Balance Debug Log\n");
+                fprintf(massBalanceLog, "# Format: step,nodeID,oldDepth,newDepth,oldVolume,newVolume,inflow,outflow\n");
+            }
         }
     }
-#endif
+    routingStepCount++;
 
-    // --- CPU path: keep iterating until convergence
+    // --- Picard iteration loop (both CPU and GPU use same structure)
+    // --- Link flows must be recomputed each iteration because they depend
+    //     on node heads, which change as node depths are updated
+
+    // DEBUG: Log first few routing steps
+    static int routingStepDebugCount = 0;
+    int logThisStep = (routingStepDebugCount < 5);
+    if (logThisStep && g_gpuConfig.useCuda) {
+        printf("=== ROUTING STEP %d: tStep = %.6f sec ===\n", routingStepDebugCount, tStep);
+    }
+    routingStepDebugCount++;
+
     while ( Steps < MaxTrials )
     {
         // --- execute a routing step & check for nodal convergence
         initNodeStates();
+        if (logThisStep && g_gpuConfig.useCuda) {
+            printf("  Picard iteration %d: calling findLinkFlows(dt=%.6f)\n", Steps, tStep);
+        }
         findLinkFlows(tStep);
+        if (logThisStep && g_gpuConfig.useCuda) {
+            printf("  Picard iteration %d: calling findNodeDepths(dt=%.6f)\n", Steps, tStep);
+        }
         converged = findNodeDepths(tStep);
         Steps++;
         if ( Steps > 1 )
@@ -364,6 +349,29 @@ gpu_path_complete:
 
     //  --- identify any capacity-limited conduits
     findLimitedLinks();
+
+    // --- DEBUG: Log node states after routing step
+    if (routingStepCount <= 20 && g_gpuConfig.useCuda && massBalanceLog) {
+        for (int i = 0; i < Nobjects[NODE]; i++) {
+            // Only log nodes with significant activity
+            if (Node[i].newDepth > 0.01 || Node[i].inflow > 0.01 || Node[i].outflow > 0.01) {
+                fprintf(massBalanceLog, "%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                        routingStepCount-1, Node[i].ID,
+                        Node[i].oldDepth, Node[i].newDepth,
+                        Node[i].oldVolume, Node[i].newVolume,
+                        Node[i].inflow, Node[i].outflow);
+            }
+        }
+        fflush(massBalanceLog);
+
+        if (routingStepCount == 20) {
+            fprintf(massBalanceLog, "# Logging complete (20 routing steps)\n");
+            fclose(massBalanceLog);
+            massBalanceLog = NULL;
+            printf("\n  ... GPU mass balance log written to /tmp/gpu_mass_balance.txt\n");
+        }
+    }
+
     return Steps;
 }
 
@@ -507,18 +515,11 @@ void findLinkFlows(double dt)
             crownCutoff,
             InertDamping);
 
-        // If GPU succeeded, return (node flows already updated by GPU)
+        // If GPU succeeded, return (ALL links and node flows already updated by GPU)
         if (gpuResult == 0)
         {
-            // --- still need to process non-conduit links on CPU
-            for (i = 0; i < Nobjects[LINK]; i++)
-            {
-                if ( !isTrueConduit(i) )
-                {
-                    if ( !Link[i].bypassed ) findNonConduitFlow(i, dt);
-                    updateNodeFlows(i);
-                }
-            }
+            // GPU has processed ALL link types (conduits, pumps, orifices, weirs, outlets)
+            // and updated node flows via three-phase pump processing
             return;
         }
 
@@ -613,12 +614,34 @@ double getModPumpFlow(int i, double q, double dt)
     double newNetInflow;               // inflow - outflow rate (cfs)
     double netFlowVolume;              // inflow - outflow volume (ft3)
     double y;                          // node depth (ft)
+    static int pumpDebugCounts[64];
+    int debugSlot = -1;
+    int logPump = (k == 1 || k == 15 || k == 20 || k == 22 || k == 24 || k == 25 || k == 26 ||
+                   k == 32 || k == 35 || k == 38 || k == 41 || k == 43 || k == 45);
 
     if ( q == 0.0 ) return q;
 
+    if (logPump) debugSlot = pumpDebugCounts[k]++;
+
     // --- case where inlet node is a storage node: 
     //     prevent node volume from going negative
-    if ( Node[j].type == STORAGE ) return node_getMaxOutflow(j, q, dt); 
+    if ( Node[j].type == STORAGE ) {
+        if (logPump && debugSlot < 200) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                "CPU pump[%d] storage pre-mod (call=%d): dt=%.6f node=%d oldVol=%.6f inflow=%.6f outflow=%.6f qCurve=%.6f",
+                k, debugSlot, dt, j, Node[j].oldVolume, Node[j].inflow, Node[j].outflow, q);
+            printf("%s\n", msg);
+        }
+        double qMod = node_getMaxOutflow(j, q, dt);
+        if (logPump && debugSlot < 200) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                "CPU pump[%d] storage post-mod (call=%d): qFinal=%.6f", k, debugSlot, qMod);
+            printf("%s\n", msg);
+        }
+        return qMod;
+    }
 
     // --- case where inlet is a non-storage node
     switch ( Pump[k].type )
@@ -636,7 +659,23 @@ double getModPumpFlow(int i, double q, double dt)
          newNetInflow = Node[j].inflow - Node[j].outflow - q;
          netFlowVolume = 0.5 * (Node[j].oldNetInflow + newNetInflow ) * dt;
          y = Node[j].oldDepth + netFlowVolume / Xnode[j].newSurfArea;
-         if ( y <= 0.0 ) return Node[j].inflow;
+         if (logPump && debugSlot < 200) {
+             char msg[256];
+             snprintf(msg, sizeof(msg),
+                 "CPU pump[%d] junction pre-mod (call=%d): dt=%.6f node=%d oldDepth=%.6f oldVol=%.6f surf=%.6f inflow=%.6f outflow=%.6f qCurve=%.6f y=%.6f",
+                 k, debugSlot, dt, j, Node[j].oldDepth, Node[j].oldVolume, Xnode[j].newSurfArea, Node[j].inflow, Node[j].outflow, q, y);
+             printf("%s\n", msg);
+         }
+         if ( y <= 0.0 ) {
+             if (logPump && debugSlot < 200) {
+                 char msg[256];
+                 snprintf(msg, sizeof(msg),
+                     "CPU pump[%d] junction limited by depth (call=%d): returning inflow %.6f",
+                     k, debugSlot, Node[j].inflow);
+                 printf("%s\n", msg);
+             }
+             return Node[j].inflow;
+         }
     }
     return q;
 }

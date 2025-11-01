@@ -21,6 +21,29 @@
 #include "gpu_table_helpers.cuh"
 #include "gpu_nonconduit_helpers.cuh"
 
+#define GPU_PUMP_DEBUG_MAX 256
+
+typedef struct {
+    double dt;
+    double qCurve;
+    double qFinal;
+    double oldVolume;
+    double inflowBeforeUp;
+    double outflowBeforeUp;
+    double inflowAfterUp;
+    double outflowAfterUp;
+    double inflowBeforeDown;
+    double inflowAfterDown;
+    double oldDepth;
+    double newSurf;
+    int pumpIndex;
+    int upNodeIndex;
+    int downNodeIndex;
+    int callIndex;
+} GPUPumpDebugEntry;
+
+__device__ GPUPumpDebugEntry g_gpuPumpDebugEntries[64 * GPU_PUMP_DEBUG_MAX];
+
 extern "C" {
 #include "headers.h"
 #include "dynwave_data.h"
@@ -94,6 +117,10 @@ static void copyLinksToGpu(GPU_LinkData* gpuLinks)
             gpuLinks->h_qFull[j] = Link[j].qFull;
             gpuLinks->h_direction[j] = Link[j].direction;
             gpuLinks->h_hasFlapGate[j] = Link[j].hasFlapGate;
+            if (Link[j].type == PUMP) {
+                printf("Link %d (pump %d) node1=%d node2=%d\n",
+                       j, Link[j].subIndex, Link[j].node1, Link[j].node2);
+            }
         }
         g_conduitKernelCtx.linkStaticsInitialized = 1;
         g_conduitKernelCtx.linkStaticsUploaded = 0;
@@ -283,11 +310,17 @@ static void copyNodesToGpu(GPU_NodeData* gpuNodes)
     }
 
     int count = gpuNodes->count;
+    static int copyIteration = 0;
     for (int i = 0; i < count; i++)
     {
         gpuNodes->h_newDepth[i]    = Node[i].newDepth;
         gpuNodes->h_oldDepth[i]    = Node[i].oldDepth;
         gpuNodes->h_oldVolume[i]   = Node[i].oldVolume;
+        if (i == 852 && copyIteration < 3000) {
+            printf("copyNodesToGpu(iter=%d): node 852 oldVol=%.6f newVol=%.6f oldDepth=%.6f newDepth=%.6f\n",
+                   copyIteration, Node[i].oldVolume, Node[i].newVolume,
+                   Node[i].oldDepth, Node[i].newDepth);
+        }
         gpuNodes->h_newVolume[i]   = Node[i].newVolume;
         gpuNodes->h_oldNetInflow[i]= Node[i].oldNetInflow;
         gpuNodes->h_inflow[i]      = Node[i].inflow;
@@ -306,6 +339,7 @@ static void copyNodesToGpu(GPU_NodeData* gpuNodes)
         g_conduitKernelCtx.nodeStaticsUploaded = 1;
     }
     gpu_transferNodeDynamicToDevice(gpuNodes, gpuNodes->count);
+    copyIteration++;
 }
 
 static void copyNodesFromGpu(GPU_NodeData* gpuNodes)
@@ -537,6 +571,7 @@ __global__ void kernel_findPumpFlows(
     double ucfVolume,          // unit conversion factors
     double ucfLength,
     double ucfFlow,
+    double dt,                 // time step
     int steps)
 //
 //  Purpose: Computes flow through all pump links
@@ -610,6 +645,21 @@ __global__ void kernel_findPumpFlows(
 
     // Apply setting
     qIn *= setting;
+    // TODO: Implement parallel-safe pump flow modification
+    // The CPU version uses Node[j].outflow which is built up sequentially,
+    // but this doesn't work in parallel GPU execution
+    // For now, we skip this check - may cause minor mass balance issues
+    //
+    // qIn = gpu_getModPumpFlow(
+    //     k, n1, qIn, dt, pumpType,
+    //     nodes->d_type,
+    //     nodes->d_inflow,
+    //     nodes->d_outflow,
+    //     nodes->d_oldDepth,
+    //     nodes->d_oldNetInflow,
+    //     nodes->d_oldVolume,
+    //     nodes->d_fullVolume,
+    //     nodes->d_newSurfArea);
 
     // Update link state
     links->d_newFlow[j] = qIn;
@@ -627,6 +677,342 @@ __global__ void kernel_findPumpFlows(
     if (pumpType == 2 || pumpType == 4) {
         atomicAdd(&nodes->d_sumdqdh[n2], dqdh);
     }
+}
+
+//=============================================================================
+// Kernel: Find Preliminary Pump Flows (Phase 1 of 2-pass processing)
+//=============================================================================
+
+__global__ void kernel_findPumpFlows_Preliminary(
+    GPU_LinkData* links,
+    GPU_PumpData* pumps,
+    GPU_NodeData* nodes,
+    GPU_CurveData* curves,
+    GPU_CurvePoints* points,
+    double ucfVolume,
+    double ucfLength,
+    double ucfFlow,
+    double dt,
+    int steps,
+    double* d_prelimFlows,  // OUTPUT: preliminary pump flows before modification
+    double* d_prelimDqdh,   // OUTPUT: preliminary dqdh values
+    char* d_prelimFlowClass) // OUTPUT: preliminary flow classes
+//
+//  Purpose: Computes preliminary pump flows without updating node flows
+//           This allows all links to finish before modifying pump flows
+//
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;  // Pump index
+
+    if (k >= pumps->count) return;
+
+    // Get link index for this pump
+    int j = pumps->d_linkIndex[k];
+
+    // Skip bypassed links or closed pumps
+    if (links->d_bypassed[j] || links->d_setting[j] == 0.0) {
+        d_prelimFlows[k] = 0.0;
+        d_prelimDqdh[k] = 0.0;
+        d_prelimFlowClass[k] = 0;
+        return;
+    }
+
+    int n1 = links->d_node1[j];
+    int n2 = links->d_node2[j];
+    int curveIdx = pumps->d_pumpCurve[k];
+
+    double qIn = 0.0;
+    double dqdh = 0.0;
+    char flowClass = 0;
+
+    int pumpType = pumps->d_type[k];
+    double xMin = pumps->d_xMin[k];
+    double xMax = pumps->d_xMax[k];
+    double setting = links->d_setting[j];
+
+    // Compute flow based on pump type
+    switch (pumpType) {
+        case 5: // IDEAL_PUMP
+            qIn = gpu_pump_getIdealFlow(n1, nodes->d_inflow, nodes->d_overflow);
+            break;
+
+        case 0: // TYPE1_PUMP (volume curve)
+            qIn = gpu_pump_getType1Flow(k, curveIdx, nodes->d_newVolume[n1],
+                ucfVolume, ucfFlow, xMin, xMax, &flowClass, curves, points);
+            break;
+
+        case 1: // TYPE2_PUMP (depth curve, discrete)
+            qIn = gpu_pump_getType2Flow(k, curveIdx, nodes->d_newDepth[n1],
+                ucfLength, ucfFlow, xMin, xMax, &flowClass, curves, points);
+            break;
+
+        case 2: // TYPE3_PUMP (head curve, continuous)
+        case 4: // TYPE5_PUMP (variable speed TYPE3)
+        {
+            double speed = (pumpType == 4) ? setting : 1.0;
+            qIn = gpu_pump_getType3Flow(curveIdx,
+                nodes->d_newDepth[n1], nodes->d_invertElev[n1],
+                nodes->d_newDepth[n2], nodes->d_invertElev[n2],
+                speed, ucfLength, ucfFlow, xMin, xMax,
+                &flowClass, &dqdh, curves, points);
+            break;
+        }
+
+        case 3: // TYPE4_PUMP (depth curve, continuous)
+            qIn = gpu_pump_getType4Flow(curveIdx, nodes->d_newDepth[n1],
+                ucfLength, ucfFlow, xMin, xMax, &flowClass, &dqdh, curves, points);
+            break;
+    }
+
+    // No reverse flow through pumps
+    if (qIn < 0.0) qIn = 0.0;
+
+    // Apply setting
+    qIn *= setting;
+
+
+    // Store preliminary results (don't update links/nodes yet)
+    d_prelimFlows[k] = qIn;
+    d_prelimDqdh[k] = dqdh;
+    d_prelimFlowClass[k] = flowClass;
+}
+
+//=============================================================================
+// Kernel: Accumulate Preliminary Pump Outflows (Phase 1b of 3-phase processing)
+//=============================================================================
+
+__global__ void kernel_accumulatePreliminaryPumpOutflows(
+    GPU_LinkData* links,
+    GPU_PumpData* pumps,
+    GPU_NodeData* nodes,
+    const double* d_prelimFlows)  // INPUT: preliminary flows from Phase 1
+//
+//  Purpose: Accumulate preliminary pump flows to node inflows/outflows
+//           This happens BEFORE getModPumpFlow() modification
+//           Allows Phase 2 to see complete outflow when applying modifications
+//
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;  // Pump index
+
+    if (k >= pumps->count) return;
+
+    int j = pumps->d_linkIndex[k];
+    double qIn = d_prelimFlows[k];
+
+    // Skip bypassed or zero flow
+    if (links->d_bypassed[j] || qIn == 0.0) return;
+
+    int n1 = links->d_node1[j];
+    int n2 = links->d_node2[j];
+
+    // Accumulate preliminary flows ONLY to downstream node inflow
+    // DO NOT add to d_outflow yet - that will be done in Phase 2 after getModPumpFlow
+    // This way d_nodeOutflow in Phase 2 only contains conduit flows (matching CPU behavior)
+    // atomicAdd(&nodes->d_outflow[n1], qIn);  // REMOVED - do this in Phase 2 instead
+    atomicAdd(&nodes->d_inflow[n2], qIn);
+}
+
+//=============================================================================
+// Kernel: Process Pumps FULLY SEQUENTIALLY (Exact CPU Logic)
+//=============================================================================
+
+__device__ int g_gpuPumpDebugCounter[64];
+
+__global__ void kernel_processPumpsSequentially(
+    GPU_LinkData* links,
+    GPU_PumpData* pumps,
+    GPU_NodeData* nodes,
+    GPU_CurveData* curves,
+    GPU_CurvePoints* curvePoints,
+    double dt,
+    int routeModel,
+    double ucfVolume,
+    double ucfLength,
+    double ucfFlow)
+//
+//  Purpose: Process ALL pumps sequentially in a single kernel, EXACTLY like CPU.
+//           Each pump: compute flow → getModPumpFlow → update nodes → next pump
+//           This ensures each pump sees the exact state the CPU sees.
+//
+{
+    // Single thread processes ALL pumps sequentially
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    printf("GPU sequential pump kernel invoked dt=%.6f count=%d\n", dt, pumps->count);
+
+    // Process each pump sequentially (EXACTLY like CPU for-loop)
+    for (int k = 0; k < pumps->count; k++) {
+
+    int j = pumps->d_linkIndex[k];
+
+    // Skip if bypassed
+    if (links->d_bypassed[j]) {
+        links->d_newFlow[j] = 0.0;
+        links->d_newDepth[j] = 0.0;
+        links->d_dqdh[j] = 0.0;
+        links->d_flowClass[j] = 0;
+        continue;
+    }
+
+    int n1 = links->d_node1[j];
+    int n2 = links->d_node2[j];
+
+    bool logPump = (k == 1 || k == 15 || k == 20 || k == 22 || k == 24 || k == 25 || k == 26 ||
+                    k == 32 || k == 35 || k == 38 || k == 41 || k == 43 || k == 45);
+    int debugSlot = -1;
+    if (logPump) {
+        debugSlot = atomicAdd(&g_gpuPumpDebugCounter[k], 1);
+        int debugPrintLimit = (k == 1 || k == 22 || k == 45) ? 4000 : 5;
+        if (debugSlot < debugPrintLimit) {
+            double oldVolDebug = nodes->d_oldVolume[n1];
+            printf("GPU pump[%d] upstream node=%d downstream=%d oldVol=%.6f (call=%d)\n",
+                   k, n1, n2, oldVolDebug, debugSlot);
+        }
+    }
+
+    double inflowUpBefore = nodes->d_inflow[n1];
+    double outflowUpBefore = nodes->d_outflow[n1];
+    double inflowDownBefore = nodes->d_inflow[n2];
+
+    // STEP 1: Compute pump flow from curve (exactly like CPU/Phase 1)
+    double qIn = 0.0;
+    double dqdh = 0.0;
+    char flowClass = 0;
+
+    int pumpType = pumps->d_type[k];
+    int curveIdx = pumps->d_pumpCurve[k];
+    double xMin = pumps->d_xMin[k];
+    double xMax = pumps->d_xMax[k];
+    double setting = links->d_setting[j];
+
+    // Skip if pump is closed
+    if (setting == 0.0) {
+        links->d_newFlow[j] = 0.0;
+        links->d_newDepth[j] = 0.0;
+        links->d_dqdh[j] = 0.0;
+        links->d_flowClass[j] = 0;
+        continue;
+    }
+
+    // Compute flow based on pump type (inline from kernel_findPumpFlows_Preliminary)
+    switch (pumpType) {
+        case 5: // IDEAL_PUMP
+            qIn = gpu_pump_getIdealFlow(n1, nodes->d_inflow, nodes->d_overflow);
+            break;
+
+        case 0: // TYPE1_PUMP (volume curve)
+            qIn = gpu_pump_getType1Flow(k, curveIdx, nodes->d_newVolume[n1],
+                ucfVolume, ucfFlow, xMin, xMax, &flowClass, curves, curvePoints);
+            break;
+
+        case 1: // TYPE2_PUMP (depth curve, discrete)
+            qIn = gpu_pump_getType2Flow(k, curveIdx, nodes->d_newDepth[n1],
+                ucfLength, ucfFlow, xMin, xMax, &flowClass, curves, curvePoints);
+            break;
+
+        case 2: // TYPE3_PUMP (head curve, continuous)
+        case 4: // TYPE5_PUMP (variable speed TYPE3)
+        {
+            double speed = (pumpType == 4) ? setting : 1.0;
+            qIn = gpu_pump_getType3Flow(curveIdx,
+                nodes->d_newDepth[n1], nodes->d_invertElev[n1],
+                nodes->d_newDepth[n2], nodes->d_invertElev[n2],
+                speed, ucfLength, ucfFlow, xMin, xMax,
+                &flowClass, &dqdh, curves, curvePoints);
+            break;
+        }
+
+        case 3: // TYPE4_PUMP (depth curve, continuous)
+            qIn = gpu_pump_getType4Flow(curveIdx, nodes->d_newDepth[n1],
+                ucfLength, ucfFlow, xMin, xMax, &flowClass, &dqdh, curves, curvePoints);
+            break;
+    }
+
+    // No reverse flow through pumps
+    if (qIn < 0.0) qIn = 0.0;
+
+    // Apply setting
+    qIn *= setting;
+
+    double qCurve = qIn;
+
+    // Skip if zero flow
+    if (qIn == 0.0) {
+        links->d_newFlow[j] = 0.0;
+        links->d_newDepth[j] = 0.0;
+        links->d_dqdh[j] = 0.0;
+        links->d_flowClass[j] = 0;
+        continue;
+    }
+
+    // STEP 2: Apply getModPumpFlow() to prevent over-draining
+    // At this point, d_nodeOutflow contains: conduits + previous pumps (EXACTLY like CPU!)
+    double qOriginal = qIn;
+    qIn = gpu_getModPumpFlow(
+        k, n1, qIn, 0.0, dt, pumps->d_type[k],  // qPrelim=0 (not used in new approach)
+        nodes->d_type,
+        nodes->d_inflow,
+        nodes->d_outflow,      // Contains conduits + pumps 0..(k-1)
+        nodes->d_oldDepth,
+        nodes->d_oldNetInflow,
+        nodes->d_oldVolume,
+        nodes->d_fullVolume,
+        nodes->d_newSurfArea);
+
+    if (logPump && debugSlot > -1 && debugSlot < 20) {
+        printf("GPU pump[%d] post-mod: qFinal=%.6f dqdh=%.6f flowClass=%d oldDepth=%.6f newSurf=%.6f\n",
+               k, qIn, dqdh, (int)flowClass,
+               nodes->d_oldDepth[n1],
+               nodes->d_newSurfArea[n1]);
+    }
+
+    // STEP 3: Update link state
+    links->d_newFlow[j] = qIn;
+    links->d_newDepth[j] = 0.0;
+    links->d_dqdh[j] = dqdh;
+    links->d_flowClass[j] = flowClass;
+
+    // STEP 4: IMMEDIATELY update node flows (EXACTLY like CPU updateNodeFlows!)
+    // No atomicAdd needed - we're sequential
+    nodes->d_outflow[n1] += qIn;
+    nodes->d_inflow[n2] += qIn;
+
+    double inflowUpAfter = nodes->d_inflow[n1];
+    double outflowUpAfter = nodes->d_outflow[n1];
+    double inflowDownAfter = nodes->d_inflow[n2];
+
+    if (logPump && debugSlot > -1 && debugSlot < 20) {
+        printf("GPU pump[%d] node update: newOut=%.6f newIn=%.6f\n",
+               k, nodes->d_outflow[n1], nodes->d_inflow[n2]);
+    }
+
+    if (logPump && debugSlot > -1 && debugSlot < GPU_PUMP_DEBUG_MAX) {
+        GPUPumpDebugEntry* entry = &g_gpuPumpDebugEntries[k * GPU_PUMP_DEBUG_MAX + debugSlot];
+        entry->dt = dt;
+        entry->qCurve = qCurve;
+        entry->qFinal = qIn;
+        entry->oldVolume = nodes->d_oldVolume[n1];
+        entry->inflowBeforeUp = inflowUpBefore;
+        entry->outflowBeforeUp = outflowUpBefore;
+        entry->inflowAfterUp = inflowUpAfter;
+        entry->outflowAfterUp = outflowUpAfter;
+        entry->inflowBeforeDown = inflowDownBefore;
+        entry->inflowAfterDown = inflowDownAfter;
+        entry->oldDepth = nodes->d_oldDepth[n1];
+        entry->newSurf = nodes->d_newSurfArea[n1];
+        entry->pumpIndex = k;
+        entry->upNodeIndex = n1;
+        entry->downNodeIndex = n2;
+        entry->callIndex = debugSlot;
+    }
+
+    // Add dqdh contributions just like CPU updateNodeFlows()
+    nodes->d_sumdqdh[n1] += dqdh;
+    if (pumpType != TYPE4_PUMP) {
+        nodes->d_sumdqdh[n2] += dqdh;
+    }
+
+    } // End of sequential for loop
 }
 
 //=============================================================================
@@ -1061,6 +1447,18 @@ int gpu_computeConduitFlows(
     double ucfFlow = UCF(FLOW);
     int routeModel = RouteModel;
 
+    static int printedPumpCount = 0;
+    if (!printedPumpCount) {
+        printf("GPU pump count = %d\n", g_gpuPumps.count);
+        if (g_gpuPumps.h_linkIndex != NULL) {
+            for (int dbgIdx = 0; dbgIdx < g_gpuPumps.count; ++dbgIdx) {
+                int linkIdx = g_gpuPumps.h_linkIndex[dbgIdx];
+                printf("GPU pump map: k=%d link=%d\n", dbgIdx, linkIdx);
+            }
+        }
+        printedPumpCount = 1;
+    }
+
     // Allocate and copy device memory for non-conduit data structures (one-time only)
     static GPU_PumpData* d_gpuPumps = NULL;
     static GPU_OrificeData* d_gpuOrifices = NULL;
@@ -1070,11 +1468,25 @@ int gpu_computeConduitFlows(
     static GPU_CurvePoints* d_gpuCurvePoints = NULL;
     static int nonConduitStructuresInitialized = 0;
 
+    // Pump preliminary flow buffers (for two-pass processing)
+    static double* d_prelimPumpFlows = NULL;
+    static double* d_prelimPumpDqdh = NULL;
+    static char* d_prelimPumpFlowClass = NULL;
+    static int prelimPumpBuffersAllocated = 0;
+
     // One-time allocation and transfer of data structures (device pointers)
     if (!nonConduitStructuresInitialized) {
         if (g_gpuPumps.count > 0) {
             CUDA_CHECK(cudaMalloc(&d_gpuPumps, sizeof(GPU_PumpData)));
             CUDA_CHECK(cudaMemcpy(d_gpuPumps, &g_gpuPumps, sizeof(GPU_PumpData), cudaMemcpyHostToDevice));
+
+            // Allocate preliminary pump flow buffers
+            if (!prelimPumpBuffersAllocated) {
+                CUDA_CHECK(cudaMalloc(&d_prelimPumpFlows, g_gpuPumps.count * sizeof(double)));
+                CUDA_CHECK(cudaMalloc(&d_prelimPumpDqdh, g_gpuPumps.count * sizeof(double)));
+                CUDA_CHECK(cudaMalloc(&d_prelimPumpFlowClass, g_gpuPumps.count * sizeof(char)));
+                prelimPumpBuffersAllocated = 1;
+            }
         }
         if (g_gpuOrifices.count > 0) {
             CUDA_CHECK(cudaMalloc(&d_gpuOrifices, sizeof(GPU_OrificeData)));
@@ -1105,15 +1517,7 @@ int gpu_computeConduitFlows(
 
     CUDA_CHECK_LAST_ERROR();
 
-    // Launch pump kernel if pumps exist and GPU data is initialized
-    if (Nlinks[PUMP] > 0 && g_gpuPumps.count > 0) {
-        int pumpGridSize = GRID_SIZE(g_gpuPumps.count, blockSize);
-        kernel_findPumpFlows<<<pumpGridSize, blockSize, 0, stream>>>(
-            d_links, d_gpuPumps, d_nodes, d_gpuCurves, d_gpuCurvePoints,
-            ucfVolume, ucfLength, ucfFlow, steps);
-        CUDA_CHECK_LAST_ERROR();
-    }
-
+    // RE-ENABLE weirs/orifices/outlets to test if they work without pumps
     // Launch orifice kernel if orifices exist and GPU data is initialized
     if (Nlinks[ORIFICE] > 0 && g_gpuOrifices.count > 0) {
         int orificeGridSize = GRID_SIZE(g_gpuOrifices.count, blockSize);
@@ -1136,6 +1540,18 @@ int gpu_computeConduitFlows(
         kernel_findOutletFlows<<<outletGridSize, blockSize, 0, stream>>>(
             d_links, d_gpuOutlets, d_nodes, d_gpuCurves, d_gpuCurvePoints,
             ucfLength, ucfFlow, omega, routeModel);
+        CUDA_CHECK_LAST_ERROR();
+    }
+
+    // TEMPORARY: Disable pumps to test Session18
+    // FULLY SEQUENTIAL PUMP PROCESSING (Exact CPU Logic)
+    // Process each pump: compute flow → getModPumpFlow → update nodes → next pump
+    // This matches CPU behavior EXACTLY where each pump sees previous pumps' effects
+    if (false && Nlinks[PUMP] > 0 && g_gpuPumps.count > 0) {
+        kernel_processPumpsSequentially<<<1, 1, 0, stream>>>(
+            d_links, d_gpuPumps, d_nodes, d_gpuCurves, d_gpuCurvePoints,
+            dt, routeModel,
+            ucfVolume, ucfLength, ucfFlow);
         CUDA_CHECK_LAST_ERROR();
     }
 
@@ -1177,15 +1593,25 @@ int gpu_computeConduitFlows(
     copyNodesFromGpu(nodes);  // Node inflow/outflow updated by kernel
     g_conduitKernelCtx.resultsDirty = 1;
 
-    // --- DEBUG: Log link flow discrepancies for first few iterations
+    // --- DEBUG: Log link flow and node flow discrepancies for first few iterations
     static int debugIterationCount = 0;
     static FILE* debugFile = NULL;
-    if (debugIterationCount < 100) {  // Log first 100 iterations
+    static FILE* nodeDebugFile = NULL;
+
+    if (debugIterationCount < 200) {  // Log first 100 iterations
         if (debugFile == NULL) {
             debugFile = fopen("/tmp/gpu_link_flow_debug.txt", "w");
             if (debugFile) {
                 fprintf(debugFile, "# GPU Link Flow Debug Log\n");
                 fprintf(debugFile, "# Format: iteration, linkIndex, linkID, linkType, cpuFlow, gpuFlow, absDiff, relDiff\n");
+            }
+        }
+
+        if (nodeDebugFile == NULL) {
+            nodeDebugFile = fopen("/tmp/gpu_node_flow_debug.txt", "w");
+            if (nodeDebugFile) {
+                fprintf(nodeDebugFile, "# GPU Node Flow Debug Log\n");
+                fprintf(nodeDebugFile, "# Format: iteration, nodeIndex, nodeID, cpuInflow, gpuInflow, cpuOutflow, gpuOutflow\n");
             }
         }
 
@@ -1217,14 +1643,78 @@ int gpu_computeConduitFlows(
                 }
             }
             fflush(debugFile);
+
+            // Log node flows for pump-connected nodes
+            if (nodeDebugFile) {
+                for (int i = 0; i < Nobjects[NODE]; i++) {
+                    // Only log nodes that have non-zero CPU or GPU flows
+                    double cpuInflow = Node[i].inflow;
+                    double cpuOutflow = Node[i].outflow;
+                    double gpuInflow = nodes->h_inflow[i];
+                    double gpuOutflow = nodes->h_outflow[i];
+
+                    if (cpuInflow > 0.001 || cpuOutflow > 0.001 ||
+                        gpuInflow > 0.001 || gpuOutflow > 0.001) {
+                        fprintf(nodeDebugFile, "%d,%d,%s,%.6f,%.6f,%.6f,%.6f\n",
+                                debugIterationCount, i, Node[i].ID,
+                                cpuInflow, gpuInflow, cpuOutflow, gpuOutflow);
+                    }
+                }
+                fflush(nodeDebugFile);
+            }
+
+        }
+
+        if (nodeDebugFile && debugIterationCount < 200) {
+            int hostPumpCounts[64];
+            GPUPumpDebugEntry hostPumpEntries[64 * GPU_PUMP_DEBUG_MAX];
+            CUDA_CHECK(cudaMemcpyFromSymbol(hostPumpCounts, g_gpuPumpDebugCounter, sizeof(hostPumpCounts)));
+            CUDA_CHECK(cudaMemcpyFromSymbol(hostPumpEntries, g_gpuPumpDebugEntries, sizeof(hostPumpEntries)));
+            int targetPumps[] = {15, 20, 22, 24, 25, 26, 32, 35, 38, 41, 43, 45};
+            int targetCount = sizeof(targetPumps) / sizeof(targetPumps[0]);
+            for (int tp = 0; tp < targetCount; ++tp) {
+                int pk = targetPumps[tp];
+                fprintf(nodeDebugFile, "pump_debug_count iter=%d pump=%d count=%d\n", debugIterationCount, pk, hostPumpCounts[pk]);
+                int limit = hostPumpCounts[pk];
+                if (limit > GPU_PUMP_DEBUG_MAX) limit = GPU_PUMP_DEBUG_MAX;
+                for (int e = 0; e < limit; ++e) {
+                    GPUPumpDebugEntry* entry = &hostPumpEntries[pk * GPU_PUMP_DEBUG_MAX + e];
+                    fprintf(nodeDebugFile,
+                            "pump_debug iter=%d pump=%d node=%d downNode=%d call=%d dt=%.6f qCurve=%.6f qFinal=%.6f oldVol=%.6f inUp=%.6f->%.6f outUp=%.6f->%.6f inDown=%.6f->%.6f\n",
+                            debugIterationCount,
+                            entry->pumpIndex,
+                            entry->upNodeIndex,
+                            entry->downNodeIndex,
+                            entry->callIndex,
+                            entry->dt,
+                            entry->qCurve,
+                            entry->qFinal,
+                            entry->oldVolume,
+                            entry->inflowBeforeUp,
+                            entry->inflowAfterUp,
+                            entry->outflowBeforeUp,
+                            entry->outflowAfterUp,
+                            entry->inflowBeforeDown,
+                            entry->inflowAfterDown);
+                }
+            }
+            fflush(nodeDebugFile);
         }
         debugIterationCount++;
 
-        if (debugIterationCount == 100 && debugFile) {
-            fprintf(debugFile, "# Debug logging complete (100 iterations)\n");
-            fclose(debugFile);
-            debugFile = NULL;
-            printf("\n  ... GPU flow debug log written to /tmp/gpu_link_flow_debug.txt\n");
+        if (debugIterationCount == 200) {
+            if (debugFile) {
+                fprintf(debugFile, "# Debug logging complete (100 iterations)\n");
+                fclose(debugFile);
+                debugFile = NULL;
+                printf("\n  ... GPU flow debug log written to /tmp/gpu_link_flow_debug.txt\n");
+            }
+            if (nodeDebugFile) {
+                fprintf(nodeDebugFile, "# Debug logging complete (100 iterations)\n");
+                fclose(nodeDebugFile);
+                nodeDebugFile = NULL;
+                printf("  ... GPU node flow debug log written to /tmp/gpu_node_flow_debug.txt\n");
+            }
         }
     }
     // --- END DEBUG
