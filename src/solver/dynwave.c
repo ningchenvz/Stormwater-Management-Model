@@ -629,8 +629,9 @@ double getModPumpFlow(int i, double q, double dt)
         if (logPump && debugSlot < 200) {
             char msg[256];
             snprintf(msg, sizeof(msg),
-                "CPU pump[%d] storage pre-mod (call=%d): dt=%.6f node=%d oldVol=%.6f inflow=%.6f outflow=%.6f qCurve=%.6f",
-                k, debugSlot, dt, j, Node[j].oldVolume, Node[j].inflow, Node[j].outflow, q);
+                "CPU pump[%d] storage pre-mod (call=%d): dt=%.6f node=%d oldVol=%.6f inflow=%.6f outflow=%.6f oldNet=%.6f qCurve=%.6f",
+                k, debugSlot, dt, j, Node[j].oldVolume, Node[j].inflow, Node[j].outflow,
+                Node[j].oldNetInflow, q);
             printf("%s\n", msg);
         }
         double qMod = node_getMaxOutflow(j, q, dt);
@@ -1008,6 +1009,15 @@ double getFloodedDepth(int i, int canPond, double dV, double yNew,
     return yNew;
 
 }
+
+//=============================================================================
+
+#ifdef BUILD_GPU
+void setNodeDepth_hostWrapper(int i, double dt)
+{
+    setNodeDepth(i, dt);
+}
+#endif
 
 //=============================================================================
 

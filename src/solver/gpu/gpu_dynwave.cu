@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "gpu_config.h"
 #include "gpu_structures.h"
 #include "gpu_dynwave_kernels.cuh"
@@ -21,6 +22,13 @@ extern "C" {
 #include "headers.h"
 #include "dynwave_data.h"
 }
+
+extern "C" void setNodeDepth_hostWrapper(int i, double dt);
+
+extern GPU_CurveData* g_gpuDeviceCurves;
+extern GPU_CurvePoints* g_gpuDeviceCurvePoints;
+extern GPU_CurveData g_gpuCurves;
+extern GPU_CurvePoints g_gpuCurvePoints;
 
 typedef struct
 {
@@ -35,6 +43,26 @@ static NodeKernelContext g_nodeKernelCtx = {0};
 static cudaEvent_t g_nodeKernelStartEvent = nullptr;
 static cudaEvent_t g_nodeKernelStopEvent = nullptr;
 static int g_nodeKernelEventsInitialized = 0;
+static double* g_prevNodeNewDepth = NULL;
+static int g_prevNodeCapacity = 0;
+static double* g_prevNodeNewVolume = NULL;
+
+static int ensureDeviceCurvePointers(void)
+{
+    if (g_gpuCurves.count > 0 && g_gpuDeviceCurves == NULL) {
+        CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurves, sizeof(GPU_CurveData)));
+        CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurves, &g_gpuCurves,
+                              sizeof(GPU_CurveData), cudaMemcpyHostToDevice));
+    }
+
+    if (g_gpuCurvePoints.totalPoints > 0 && g_gpuDeviceCurvePoints == NULL) {
+        CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurvePoints, sizeof(GPU_CurvePoints)));
+        CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurvePoints, &g_gpuCurvePoints,
+                              sizeof(GPU_CurvePoints), cudaMemcpyHostToDevice));
+    }
+
+    return 0;
+}
 
 //=============================================================================
 // Kernel: Find Node Depths
@@ -48,7 +76,11 @@ __global__ void kernel_findNodeDepths(
     double minSurfArea,
     int steps,
     double omega,
-    double headTol)
+    double headTol,
+    double ucfLength,
+    double ucfVolume,
+    GPU_CurveData* curves,
+    GPU_CurvePoints* curvePoints)
 //
 //  Purpose: Computes new depth at all non-outfall nodes
 //  Input:   nodes = GPU node data structure
@@ -94,15 +126,26 @@ __global__ void kernel_findNodeDepths(
         nodes->d_pondedArea[i],
         nodes->d_crownElev[i],
         nodes->d_oldDepth[i],
+        nodes->d_oldVolume[i],
         nodes->d_oldNetInflow[i],
         nodes->d_inflow[i],
         nodes->d_outflow[i],
         nodes->d_fullVolume[i],
         nodes->d_degree[i],
+        nodes->d_storageA0[i],
+        nodes->d_storageA1[i],
+        nodes->d_storageA2[i],
+        nodes->d_storageShape[i],
+        nodes->d_storageCurve[i],
         // Xnode data
         nodes->d_newSurfArea[i],
         nodes->d_oldSurfArea[i],
         nodes->d_sumdqdh[i],
+        // Units and lookup tables
+        ucfLength,
+        ucfVolume,
+        curves,
+        curvePoints,
         // Previous iteration value
         yOld,
         // Outputs
@@ -155,10 +198,19 @@ int gpu_computeNodeDepths(
     GPU_NodeData* d_nodes = g_nodeKernelCtx.d_nodes;
     CUDA_CHECK(cudaMemcpy(d_nodes, nodes, sizeof(GPU_NodeData), cudaMemcpyHostToDevice));
 
+    ensureDeviceCurvePointers();
+
+    double ucfLength = UCF(LENGTH);
+    double ucfVolume = UCF(VOLUME);
+    GPU_CurveData* d_curves = g_gpuDeviceCurves;
+    GPU_CurvePoints* d_curvePoints = g_gpuDeviceCurvePoints;
+
     // Launch kernel
     kernel_findNodeDepths<<<gridSize, blockSize, 0, stream>>>(
         d_nodes, dt, allowPonding, surchargeMethod,
-        minSurfArea, steps, omega, headTol);
+        minSurfArea, steps, omega, headTol,
+        ucfLength, ucfVolume,
+        d_curves, d_curvePoints);
 
     CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -237,6 +289,21 @@ static void copyNodesToGpu(GPU_NodeData* nodes)
         nodes->h_oldSurfArea[i] = Xnode[i].oldSurfArea;
         nodes->h_sumdqdh[i]     = Xnode[i].sumdqdh;
         nodes->h_dYdT[i]        = Xnode[i].dYdT;
+
+        nodes->h_storageA0[i]    = 0.0;
+        nodes->h_storageA1[i]    = 0.0;
+        nodes->h_storageA2[i]    = 0.0;
+        nodes->h_storageShape[i] = 0;
+        nodes->h_storageCurve[i] = -1;
+
+        if (Node[i].type == STORAGE) {
+            int sIdx = Node[i].subIndex;
+            nodes->h_storageShape[i] = Storage[sIdx].shape;
+            nodes->h_storageCurve[i] = Storage[sIdx].aCurve;
+            nodes->h_storageA0[i]    = Storage[sIdx].a0;
+            nodes->h_storageA1[i]    = Storage[sIdx].a1;
+            nodes->h_storageA2[i]    = Storage[sIdx].a2;
+        }
     }
 
     if (!g_nodeKernelCtx.staticsUploaded)
@@ -254,9 +321,19 @@ static void copyNodesFromGpu(GPU_NodeData* nodes)
     {
         if (Node[i].type != OUTFALL)
         {
-            Node[i].newDepth  = nodes->h_newDepth[i];
-            Node[i].newVolume = nodes->h_newVolume[i];
+            double newDepth = nodes->h_newDepth[i];
+            double newVolume = nodes->h_newVolume[i];
+            if (Node[i].type == STORAGE) {
+                newVolume = node_getVolume(i, newDepth);
+                nodes->h_newVolume[i] = newVolume;
+            }
+            Node[i].newDepth  = newDepth;
+            Node[i].newVolume = newVolume;
             Node[i].overflow  = nodes->h_overflow[i];
+        }
+        if (i == 852 && nodes->h_newVolume[i] < 0.05) {
+            printf("copyNodesFromGpu: node 852 newVolume=%.6f newDepth=%.6f overflow=%.6f\n",
+                   nodes->h_newVolume[i], nodes->h_newDepth[i], nodes->h_overflow[i]);
         }
         Xnode[i].converged = nodes->h_converged[i];
         Xnode[i].newSurfArea = nodes->h_newSurfArea[i];
@@ -285,6 +362,29 @@ extern "C" int gpu_runNodeDepthKernel(
 
     cudaStream_t stream = gpu_getStream();
     GPU_NodeData* nodes = &g_nodeKernelCtx.data;
+
+    if (g_prevNodeCapacity != nodes->count) {
+        if (g_prevNodeNewDepth) {
+            free(g_prevNodeNewDepth);
+            g_prevNodeNewDepth = NULL;
+        }
+        if (g_prevNodeNewVolume) {
+            free(g_prevNodeNewVolume);
+            g_prevNodeNewVolume = NULL;
+        }
+        if (nodes->count > 0) {
+            g_prevNodeNewDepth = (double*)malloc(nodes->count * sizeof(double));
+            g_prevNodeNewVolume = (double*)malloc(nodes->count * sizeof(double));
+        }
+        g_prevNodeCapacity = nodes->count;
+    }
+    if (g_prevNodeNewDepth) {
+        for (int i = 0; i < nodes->count; i++) {
+            g_prevNodeNewDepth[i] = nodes->h_newDepth[i];
+            g_prevNodeNewVolume[i] = nodes->h_newVolume[i];
+        }
+    }
+
     copyNodesToGpu(nodes);
 
     int convergedCount = 0;
@@ -310,6 +410,62 @@ extern "C" int gpu_runNodeDepthKernel(
     gpu_profiler_addKernelTime((double)elapsedMs);
 
     copyNodesFromGpu(nodes);
+
+    if (g_prevNodeNewDepth) {
+        for (int i = 0; i < nodes->count; i++) {
+            if (Node[i].type == STORAGE) {
+                double prevDepth = g_prevNodeNewDepth ? g_prevNodeNewDepth[i] : Node[i].newDepth;
+                double prevVolume = g_prevNodeNewVolume ? g_prevNodeNewVolume[i] : Node[i].newVolume;
+                double prevSurf = node_getSurfArea(i, prevDepth);
+                if (prevSurf < MinSurfArea) prevSurf = MinSurfArea;
+                Xnode[i].newSurfArea = prevSurf;
+                if (prevDepth > Node[i].fullDepth) {
+                    Xnode[i].oldSurfArea = prevSurf;
+                }
+                Node[i].newDepth = prevDepth;
+                Node[i].newVolume = prevVolume;
+
+                // Estimate new volume/depth using mass balance before refinement
+                double oldVolume = Node[i].oldVolume;
+                double oldNet = Node[i].oldNetInflow;
+                double newNet = Node[i].inflow - Node[i].outflow;
+                double dV = 0.5 * (oldNet + newNet) * dt;
+                double volumeCandidate = oldVolume + dV;
+                double depthGuess = prevDepth;
+                if (volumeCandidate <= 0.0) {
+                    depthGuess = 0.0;
+                    volumeCandidate = 0.0;
+                } else {
+                    double volumeForDepth = volumeCandidate;
+                    if (volumeForDepth > Node[i].fullVolume) {
+                        volumeForDepth = Node[i].fullVolume;
+                        depthGuess = node_getDepth(i, volumeForDepth);
+                        if (AllowPonding && Node[i].pondedArea > 0.0) {
+                            double pondDepth = (volumeCandidate - Node[i].fullVolume) / Node[i].pondedArea;
+                            if (pondDepth > 0.0)
+                                depthGuess = Node[i].fullDepth + pondDepth;
+                        }
+                    } else {
+                        depthGuess = node_getDepth(i, volumeForDepth);
+                    }
+                }
+                Node[i].newDepth = depthGuess;
+                Node[i].newVolume = volumeCandidate;
+                setNodeDepth_hostWrapper(i, dt);
+                if (i == 852) {
+                    printf("storage host recompute node 852 prevDepth=%.6f prevVol=%.6f newDepth=%.6f newVol=%.6f overflow=%.6f\n",
+                           prevDepth, prevVolume, Node[i].newDepth, Node[i].newVolume, Node[i].overflow);
+                }
+                nodes->h_newDepth[i] = Node[i].newDepth;
+                nodes->h_newVolume[i] = Node[i].newVolume;
+                nodes->h_overflow[i] = Node[i].overflow;
+                nodes->h_newSurfArea[i] = Xnode[i].newSurfArea;
+                nodes->h_oldSurfArea[i] = Xnode[i].oldSurfArea;
+                nodes->h_sumdqdh[i] = Xnode[i].sumdqdh;
+                nodes->h_dYdT[i] = Xnode[i].dYdT;
+            }
+        }
+    }
 
     return convergedCount;
 }
@@ -351,13 +507,22 @@ extern "C" int gpu_computeNodeDepthsWithConvergence(
     CUDA_CHECK(cudaMemcpy(d_nodes, nodes, sizeof(GPU_NodeData),
                           cudaMemcpyHostToDevice));
 
+    ensureDeviceCurvePointers();
+
+    double ucfLength = UCF(LENGTH);
+    double ucfVolume = UCF(VOLUME);
+    GPU_CurveData* d_curves = g_gpuDeviceCurves;
+    GPU_CurvePoints* d_curvePoints = g_gpuDeviceCurvePoints;
+
     // Reset convergence counter
     CUDA_CHECK(cudaMemsetAsync(d_convergedCount, 0, sizeof(int), stream));
 
     // Compute node depths
     kernel_findNodeDepths<<<gridSize, blockSize, 0, stream>>>(
         d_nodes, dt, allowPonding, surchargeMethod,
-        minSurfArea, steps, omega, headTol);
+        minSurfArea, steps, omega, headTol,
+        ucfLength, ucfVolume,
+        d_curves, d_curvePoints);
     CUDA_CHECK_LAST_ERROR();
 
     // Count converged nodes using optimized reduction kernel

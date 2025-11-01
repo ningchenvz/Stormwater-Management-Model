@@ -50,13 +50,18 @@ typedef struct {
     double* h_surDepth;         // Added depth under surcharge (ft)
     double* h_pondedArea;       // Area filled by ponded water (ft2)
     double* h_crownElev;        // Top of highest flowing conduit (ft)
+    double* h_fullVolume;       // Max storage available (ft3)
+    double* h_storageA0;        // storage parameter a0 (ft2)
+    double* h_storageA1;        // storage parameter a1
+    double* h_storageA2;        // storage parameter a2
+    int*    h_storageShape;     // storage shape enum
+    int*    h_storageCurve;     // storage area curve index
 
     // Dynamic state (updated each iteration)
     double* h_oldDepth;         // Previous water depth (ft)
     double* h_newDepth;         // Current water depth (ft)
     double* h_oldVolume;        // Previous volume (ft3)
     double* h_newVolume;        // Current volume (ft3)
-    double* h_fullVolume;       // Max storage available (ft3)
     double* h_oldNetInflow;     // Previous net inflow (cfs)
     double* h_inflow;           // Total inflow (cfs)
     double* h_outflow;          // Total outflow (cfs)
@@ -81,13 +86,18 @@ typedef struct {
     double* d_surDepth;         // Added depth under surcharge (ft)
     double* d_pondedArea;       // Area filled by ponded water (ft2)
     double* d_crownElev;        // Top of highest flowing conduit (ft)
+    double* d_fullVolume;       // Max storage available (ft3)
+    double* d_storageA0;
+    double* d_storageA1;
+    double* d_storageA2;
+    int*    d_storageShape;
+    int*    d_storageCurve;
 
     // Dynamic state (updated each iteration)
     double* d_oldDepth;         // Previous water depth (ft)
     double* d_newDepth;         // Current water depth (ft)
     double* d_oldVolume;        // Previous volume (ft3)
     double* d_newVolume;        // Current volume (ft3)
-    double* d_fullVolume;       // Max storage available (ft3)
     double* d_oldNetInflow;     // Previous net inflow (cfs)
     double* d_inflow;           // Total inflow (cfs)
     double* d_outflow;          // Total outflow (cfs)
@@ -414,6 +424,23 @@ typedef struct {
     double* d_yValues;
 
 } GPU_CurvePoints;
+
+//-----------------------------------------------------------------------------
+// Global GPU Data Structures (defined in gpu_manager.cu)
+//-----------------------------------------------------------------------------
+#ifdef BUILD_GPU
+extern GPU_NodeData     g_gpuNodes;
+extern GPU_LinkData     g_gpuLinks;
+extern GPU_ConduitData  g_gpuConduits;
+extern GPU_PumpData     g_gpuPumps;
+extern GPU_OrificeData  g_gpuOrifices;
+extern GPU_WeirData     g_gpuWeirs;
+extern GPU_OutletData   g_gpuOutlets;
+extern GPU_CurveData    g_gpuCurves;
+extern GPU_CurvePoints  g_gpuCurvePoints;
+extern GPU_CurveData*   g_gpuDeviceCurves;
+extern GPU_CurvePoints* g_gpuDeviceCurvePoints;
+#endif
 
 //-----------------------------------------------------------------------------
 // Cross-Section Data (needed for flow calculations)

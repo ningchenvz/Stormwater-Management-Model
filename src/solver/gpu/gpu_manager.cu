@@ -35,6 +35,8 @@ GPU_OutletData g_gpuOutlets = {0};
 // Global GPU curve data (for pumps and outlets)
 GPU_CurveData g_gpuCurves = {0};
 GPU_CurvePoints g_gpuCurvePoints = {0};
+GPU_CurveData* g_gpuDeviceCurves = NULL;
+GPU_CurvePoints* g_gpuDeviceCurvePoints = NULL;
 
 static cudaStream_t g_gpuStream = 0;
 
@@ -166,6 +168,8 @@ void gpu_cleanup(void)
         g_gpuConfig.enabled = 0;
         g_gpuConfig.useCuda = 0;
     }
+    g_gpuDeviceCurves = NULL;
+    g_gpuDeviceCurvePoints = NULL;
     gpu_profiler_reset();
 }
 
@@ -343,6 +347,23 @@ extern "C" int gpu_initializeNonConduitData(void)
             gpu_transferCurvePointsToDevice(&g_gpuCurvePoints) != 0) {
             fprintf(stderr, "    ERROR: Failed to transfer curve data to GPU\n");
             return -1;
+        }
+
+        // Allocate (or refresh) device-side curve metadata structs
+        if (g_gpuCurves.count > 0) {
+            if (g_gpuDeviceCurves == NULL) {
+                CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurves, sizeof(GPU_CurveData)));
+            }
+            CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurves, &g_gpuCurves,
+                                  sizeof(GPU_CurveData), cudaMemcpyHostToDevice));
+        }
+
+        if (g_gpuCurvePoints.totalPoints > 0) {
+            if (g_gpuDeviceCurvePoints == NULL) {
+                CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurvePoints, sizeof(GPU_CurvePoints)));
+            }
+            CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurvePoints, &g_gpuCurvePoints,
+                                  sizeof(GPU_CurvePoints), cudaMemcpyHostToDevice));
         }
 
         printf("    Curves transferred to GPU successfully\n");

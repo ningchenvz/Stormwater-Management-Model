@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include "headers.h"
 #include "findroot.h"
 
@@ -297,6 +298,41 @@ void node_setOldHydState(int j)
 //  Purpose: replaces a node's old hydraulic state values with new ones.
 //
 {
+    static int callCount = 0;
+    static int captureInitialized = 0;
+    static int captureNode = -1;
+    static int captureCall = -1;
+    static int captureTriggered = 0;
+
+    if (!captureInitialized) {
+        const char* env = getenv("SWMM_CAPTURE_NODE_CALL");
+        if (env) {
+            int nodeId = -1;
+            int callIdx = -1;
+            if (sscanf(env, "%d:%d", &nodeId, &callIdx) == 2) {
+                captureNode = nodeId;
+                captureCall = callIdx;
+            }
+        }
+        captureInitialized = 1;
+    }
+
+    if (captureNode >= 0 && j == captureNode) {
+        if (callCount < 20 || Node[j].newVolume < 1.0) {
+            printf("CPU node_setOldHydState(node=%d, call=%d): oldVol=%.6f -> newVol=%.6f, oldDepth=%.6f -> newDepth=%.6f\n",
+                   j, callCount, Node[j].oldVolume, Node[j].newVolume,
+                   Node[j].oldDepth, Node[j].newDepth);
+        }
+        if (!captureTriggered && callCount == captureCall) {
+            printf("SWMM capture trigger reached for node %d call %d. Writing hotstart and exiting.\n",
+                   j, callCount);
+            hotstart_close();
+            fflush(NULL);
+            captureTriggered = 1;
+            exit(0);
+        }
+        callCount++;
+    }
     Node[j].oldDepth    = Node[j].newDepth;
     Node[j].oldVolume   = Node[j].newVolume;
     Node[j].oldFlowInflow = Node[j].inflow;

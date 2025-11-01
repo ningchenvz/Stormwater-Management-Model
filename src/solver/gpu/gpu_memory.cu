@@ -83,6 +83,18 @@ int gpu_allocateNodeData(GPU_NodeData* data, int nodeCount)
     hostBytes += doubleSize;
     CUDA_CHECK(cudaMallocHost((void**)&data->h_crownElev, doubleSize));
     hostBytes += doubleSize;
+    CUDA_CHECK(cudaMallocHost((void**)&data->h_fullVolume, doubleSize));
+    hostBytes += doubleSize;
+    CUDA_CHECK(cudaMallocHost((void**)&data->h_storageA0, doubleSize));
+    hostBytes += doubleSize;
+    CUDA_CHECK(cudaMallocHost((void**)&data->h_storageA1, doubleSize));
+    hostBytes += doubleSize;
+    CUDA_CHECK(cudaMallocHost((void**)&data->h_storageA2, doubleSize));
+    hostBytes += doubleSize;
+    CUDA_CHECK(cudaMallocHost((void**)&data->h_storageShape, intSize));
+    hostBytes += intSize;
+    CUDA_CHECK(cudaMallocHost((void**)&data->h_storageCurve, intSize));
+    hostBytes += intSize;
 
     // Dynamic state
     CUDA_CHECK(cudaMallocHost((void**)&data->h_oldDepth, doubleSize));
@@ -92,8 +104,6 @@ int gpu_allocateNodeData(GPU_NodeData* data, int nodeCount)
     CUDA_CHECK(cudaMallocHost((void**)&data->h_oldVolume, doubleSize));
     hostBytes += doubleSize;
     CUDA_CHECK(cudaMallocHost((void**)&data->h_newVolume, doubleSize));
-    hostBytes += doubleSize;
-    CUDA_CHECK(cudaMallocHost((void**)&data->h_fullVolume, doubleSize));
     hostBytes += doubleSize;
     CUDA_CHECK(cudaMallocHost((void**)&data->h_oldNetInflow, doubleSize));
     hostBytes += doubleSize;
@@ -135,6 +145,18 @@ int gpu_allocateNodeData(GPU_NodeData* data, int nodeCount)
     deviceBytes += doubleSize;
     CUDA_CHECK(cudaMalloc((void**)&data->d_crownElev, doubleSize));
     deviceBytes += doubleSize;
+    CUDA_CHECK(cudaMalloc((void**)&data->d_fullVolume, doubleSize));
+    deviceBytes += doubleSize;
+    CUDA_CHECK(cudaMalloc((void**)&data->d_storageA0, doubleSize));
+    deviceBytes += doubleSize;
+    CUDA_CHECK(cudaMalloc((void**)&data->d_storageA1, doubleSize));
+    deviceBytes += doubleSize;
+    CUDA_CHECK(cudaMalloc((void**)&data->d_storageA2, doubleSize));
+    deviceBytes += doubleSize;
+    CUDA_CHECK(cudaMalloc((void**)&data->d_storageShape, intSize));
+    deviceBytes += intSize;
+    CUDA_CHECK(cudaMalloc((void**)&data->d_storageCurve, intSize));
+    deviceBytes += intSize;
 
     // Dynamic state
     CUDA_CHECK(cudaMalloc((void**)&data->d_oldDepth, doubleSize));
@@ -144,8 +166,6 @@ int gpu_allocateNodeData(GPU_NodeData* data, int nodeCount)
     CUDA_CHECK(cudaMalloc((void**)&data->d_oldVolume, doubleSize));
     deviceBytes += doubleSize;
     CUDA_CHECK(cudaMalloc((void**)&data->d_newVolume, doubleSize));
-    deviceBytes += doubleSize;
-    CUDA_CHECK(cudaMalloc((void**)&data->d_fullVolume, doubleSize));
     deviceBytes += doubleSize;
     CUDA_CHECK(cudaMalloc((void**)&data->d_oldNetInflow, doubleSize));
     deviceBytes += doubleSize;
@@ -194,6 +214,12 @@ void gpu_freeNodeData(GPU_NodeData* data)
     if (data->h_surDepth) cudaFreeHost(data->h_surDepth);
     if (data->h_pondedArea) cudaFreeHost(data->h_pondedArea);
     if (data->h_crownElev) cudaFreeHost(data->h_crownElev);
+    if (data->h_fullVolume) cudaFreeHost(data->h_fullVolume);
+    if (data->h_storageA0) cudaFreeHost(data->h_storageA0);
+    if (data->h_storageA1) cudaFreeHost(data->h_storageA1);
+    if (data->h_storageA2) cudaFreeHost(data->h_storageA2);
+    if (data->h_storageShape) cudaFreeHost(data->h_storageShape);
+    if (data->h_storageCurve) cudaFreeHost(data->h_storageCurve);
     if (data->h_oldDepth) cudaFreeHost(data->h_oldDepth);
     if (data->h_newDepth) cudaFreeHost(data->h_newDepth);
     if (data->h_oldVolume) cudaFreeHost(data->h_oldVolume);
@@ -217,11 +243,16 @@ void gpu_freeNodeData(GPU_NodeData* data)
     CUDA_FREE_SAFE(data->d_surDepth);
     CUDA_FREE_SAFE(data->d_pondedArea);
     CUDA_FREE_SAFE(data->d_crownElev);
+    CUDA_FREE_SAFE(data->d_fullVolume);
+    CUDA_FREE_SAFE(data->d_storageA0);
+    CUDA_FREE_SAFE(data->d_storageA1);
+    CUDA_FREE_SAFE(data->d_storageA2);
+    CUDA_FREE_SAFE(data->d_storageShape);
+    CUDA_FREE_SAFE(data->d_storageCurve);
     CUDA_FREE_SAFE(data->d_oldDepth);
     CUDA_FREE_SAFE(data->d_newDepth);
     CUDA_FREE_SAFE(data->d_oldVolume);
     CUDA_FREE_SAFE(data->d_newVolume);
-    CUDA_FREE_SAFE(data->d_fullVolume);
     CUDA_FREE_SAFE(data->d_oldNetInflow);
     CUDA_FREE_SAFE(data->d_inflow);
     CUDA_FREE_SAFE(data->d_outflow);
@@ -1215,6 +1246,11 @@ int gpu_transferNodeStaticToDevice(GPU_NodeData* data, int count)
     CUDA_CHECK(cudaMemcpy(data->d_pondedArea, data->h_pondedArea, doubleSize, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(data->d_crownElev, data->h_crownElev, doubleSize, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(data->d_fullVolume, data->h_fullVolume, doubleSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(data->d_storageA0, data->h_storageA0, doubleSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(data->d_storageA1, data->h_storageA1, doubleSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(data->d_storageA2, data->h_storageA2, doubleSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(data->d_storageShape, data->h_storageShape, intSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(data->d_storageCurve, data->h_storageCurve, intSize, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(data->d_degree, data->h_degree, intSize, cudaMemcpyHostToDevice));
 
     return 0;

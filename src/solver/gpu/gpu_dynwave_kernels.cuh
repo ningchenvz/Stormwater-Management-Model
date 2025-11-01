@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 #include <math.h>
+#include "gpu_table_helpers.cuh"
 
 //-----------------------------------------------------------------------------
 // Constants (from dynwave.c)
@@ -35,6 +36,14 @@
 #define GPU_EXTRAN      0
 #define GPU_SLOT        1
 
+// Storage shapes (from enums.h)
+#define GPU_STORAGE_TABULAR     0
+#define GPU_STORAGE_FUNCTIONAL  1
+#define GPU_STORAGE_CYLINDRICAL 2
+#define GPU_STORAGE_CONICAL     3
+#define GPU_STORAGE_PARABOLOID  4
+#define GPU_STORAGE_PYRAMIDAL   5
+
 //-----------------------------------------------------------------------------
 // Helper Device Functions
 //-----------------------------------------------------------------------------
@@ -51,86 +60,133 @@ __device__ inline double gpu_MIN(double a, double b)
 
 //=============================================================================
 
-__device__ double gpu_node_getVolume(
-    int nodeType,
+__device__ double gpu_storage_getVolume(
     double depth,
     double fullDepth,
-    double fullVolume)
+    double fullVolume,
+    double storageA0,
+    double storageA1,
+    double storageA2,
+    int storageShape,
+    int storageCurve,
+    double ucfLength,
+    double ucfVolume,
+    const GPU_CurveData* curves,
+    const GPU_CurvePoints* points)
 //
-//  Purpose: Computes volume stored at a node from its water depth
-//  Input:   nodeType = type of node
-//           depth = water depth (ft)
-//           fullDepth = depth when node is full (ft)
-//           fullVolume = volume when node is full (ft3)
-//  Returns: Volume of water at node (ft3)
-//
-//  Note: Simplified version for non-storage nodes
-//        Storage nodes require curve lookup (not implemented yet)
+//  Purpose: Computes storage node volume from depth using shape parameters
 //
 {
-    // For now, only handle non-storage nodes (linear interpolation)
-    if (nodeType == GPU_STORAGE) {
-        // TODO: Implement storage_getVolume equivalent
-        // For now, use linear approximation
-        if (fullDepth > 0.0)
-            return fullVolume * (depth / fullDepth);
-        else
+    if (depth <= 0.0) return 0.0;
+    if (fullVolume > 0.0 && depth >= fullDepth) return fullVolume;
+
+    switch (storageShape) {
+        case GPU_STORAGE_TABULAR:
+            if (storageCurve >= 0 && curves != NULL && points != NULL) {
+                double volUser = gpu_table_getStorageVolume(
+                    storageCurve,
+                    depth * ucfLength,
+                    curves->d_dataStart,
+                    curves->d_dataCount,
+                    points->d_xValues,
+                    points->d_yValues);
+                return volUser / ucfVolume;
+            }
             return 0.0;
-    }
-    else {
-        // Regular nodes: linear relationship
-        if (fullDepth > 0.0)
-            return fullVolume * (depth / fullDepth);
-        else
+
+        case GPU_STORAGE_FUNCTIONAL:
+        {
+            double d = depth * ucfLength;
+            double n = storageA2 + 1.0;
+            double v = storageA0 * d;
+            if (storageA1 != 0.0)
+                v += storageA1 / n * pow(d, n);
+            return v / ucfVolume;
+        }
+
+        case GPU_STORAGE_CYLINDRICAL:
+        case GPU_STORAGE_CONICAL:
+        case GPU_STORAGE_PARABOLOID:
+        case GPU_STORAGE_PYRAMIDAL:
+        {
+            double d = depth * ucfLength;
+            double v = d * (storageA0 + d * (storageA1 / 2.0 + d * storageA2 / 3.0));
+            return v / ucfVolume;
+        }
+
+        default:
             return 0.0;
     }
 }
 
 //=============================================================================
 
+__device__ double gpu_node_getVolume(
+    int nodeType,
+    double depth,
+    double fullDepth,
+    double fullVolume,
+    double storageA0,
+    double storageA1,
+    double storageA2,
+    int storageShape,
+    int storageCurve,
+    double ucfLength,
+    double ucfVolume,
+    const GPU_CurveData* curves,
+    const GPU_CurvePoints* points)
+//
+//  Purpose: Computes volume stored at a node from its water depth
+//
+{
+    if (nodeType == GPU_STORAGE) {
+        return gpu_storage_getVolume(depth, fullDepth, fullVolume,
+                                     storageA0, storageA1, storageA2,
+                                     storageShape, storageCurve,
+                                     ucfLength, ucfVolume,
+                                     curves, points);
+    }
+
+    if (fullDepth > 0.0)
+        return fullVolume * (depth / fullDepth);
+
+    return 0.0;
+}
+
+//=============================================================================
+
 __device__ double gpu_getFloodedDepth(
-    int i,
     int canPond,
     double dV,
     double yNew,
     double yMax,
     double dt,
-    double pondedArea,
     double fullVolume,
-    double* overflow,      // output
-    double* newVolume)     // output
+    double oldVolume,
+    double* overflow,
+    double* newVolume)
 //
 //  Purpose: Computes depth, volume and overflow for a flooded node
-//  Input:   i = node index
-//           canPond = TRUE if water can pond over node
-//           dV = change in volume over time step (ft3)
-//           yNew = current depth at node (ft)
-//           yMax = max. depth at node before ponding (ft)
-//           dt = time step (sec)
-//           pondedArea = surface area for ponding (ft2)
-//           fullVolume = volume when full (ft3)
-//  Output:  overflow = overflow rate (cfs)
-//           newVolume = new volume (ft3)
-//  Returns: Adjusted depth at node when flooded (ft)
-//
+//           (mirrors CPU getFloodedDepth)
 {
     if (canPond == 0) {
-        // No ponding allowed - overflow
-        *overflow = dV / dt;
+        double oflow = dV / dt;
+        if (oflow < GPU_FUDGE) oflow = 0.0;
+        *overflow = oflow;
         *newVolume = fullVolume;
         return yMax;
     }
-    else {
-        // Ponding allowed
-        double dY = (yNew - yMax);
-        if (pondedArea > 0.0) {
-            dY = dV / pondedArea;
-        }
-        yNew = yMax + dY;
-        *overflow = 0.0;
-        *newVolume = fullVolume + dV;
-        return yNew;
-    }
+
+    double volume = oldVolume + dV;
+    if (volume < fullVolume) volume = fullVolume;
+    double reference = gpu_MAX(oldVolume, fullVolume);
+    double excess = volume - reference;
+    double oflow = excess / dt;
+    if (oflow < GPU_FUDGE) oflow = 0.0;
+
+    *overflow = oflow;
+    *newVolume = volume;
+    return yNew;
 }
 
 //=============================================================================
@@ -151,15 +207,26 @@ __device__ void gpu_setNodeDepth(
     double pondedArea,
     double crownElev,
     double oldDepth,
+    double oldVolume,
     double oldNetInflow,
     double inflow,
     double outflow,
     double fullVolume,
     int degree,
+    double storageA0,
+    double storageA1,
+    double storageA2,
+    int storageShape,
+    int storageCurve,
     // Xnode data
     double newSurfArea,
     double oldSurfArea_in,
     double sumdqdh,
+    // Unit conversions & lookup tables
+    double ucfLength,
+    double ucfVolume,
+    const GPU_CurveData* curves,
+    const GPU_CurvePoints* curvePoints,
     // Previous iteration value
     double newDepth_last,
     // Outputs
@@ -264,12 +331,32 @@ __device__ void gpu_setNodeDepth(
 
     // --- handle flooded conditions
     if (yNew > yMax) {
-        yNew = gpu_getFloodedDepth(i, canPond, dV, yNew, yMax, dt,
-                                    pondedArea, fullVolume,
-                                    overflow_out, newVolume_out);
+        yNew = gpu_getFloodedDepth(
+            canPond,
+            dV,
+            yNew,
+            yMax,
+            dt,
+            fullVolume,
+            oldVolume,
+            overflow_out,
+            newVolume_out);
     }
     else {
-        *newVolume_out = gpu_node_getVolume(nodeType, yNew, fullDepth, fullVolume);
+        *newVolume_out = gpu_node_getVolume(
+            nodeType,
+            yNew,
+            fullDepth,
+            fullVolume,
+            storageA0,
+            storageA1,
+            storageA2,
+            storageShape,
+            storageCurve,
+            ucfLength,
+            ucfVolume,
+            curves,
+            curvePoints);
     }
 
     // --- compute rate of depth change

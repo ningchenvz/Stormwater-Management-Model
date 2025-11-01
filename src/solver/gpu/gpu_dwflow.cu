@@ -49,6 +49,9 @@ extern "C" {
 #include "dynwave_data.h"
 }
 
+extern GPU_CurveData* g_gpuDeviceCurves;
+extern GPU_CurvePoints* g_gpuDeviceCurvePoints;
+
 //=============================================================================
 // Static Context for Conduit Flow Kernel
 //=============================================================================
@@ -303,7 +306,21 @@ static void copyNodesToGpu(GPU_NodeData* gpuNodes)
             gpuNodes->h_pondedArea[i]  = Node[i].pondedArea;
             gpuNodes->h_crownElev[i]   = Node[i].crownElev;
             gpuNodes->h_fullVolume[i]  = Node[i].fullVolume;
+            gpuNodes->h_storageA0[i]   = 0.0;
+            gpuNodes->h_storageA1[i]   = 0.0;
+            gpuNodes->h_storageA2[i]   = 0.0;
+            gpuNodes->h_storageShape[i]= 0;
+            gpuNodes->h_storageCurve[i]= -1;
             gpuNodes->h_degree[i]      = Node[i].degree;
+
+            if (Node[i].type == STORAGE) {
+                int sIdx = Node[i].subIndex;
+                gpuNodes->h_storageShape[i] = Storage[sIdx].shape;
+                gpuNodes->h_storageCurve[i] = Storage[sIdx].aCurve;
+                gpuNodes->h_storageA0[i]    = Storage[sIdx].a0;
+                gpuNodes->h_storageA1[i]    = Storage[sIdx].a1;
+                gpuNodes->h_storageA2[i]    = Storage[sIdx].a2;
+            }
         }
         g_conduitKernelCtx.nodeStaticsInitialized = 1;
         g_conduitKernelCtx.nodeStaticsUploaded = 0;
@@ -316,10 +333,20 @@ static void copyNodesToGpu(GPU_NodeData* gpuNodes)
         gpuNodes->h_newDepth[i]    = Node[i].newDepth;
         gpuNodes->h_oldDepth[i]    = Node[i].oldDepth;
         gpuNodes->h_oldVolume[i]   = Node[i].oldVolume;
+        if (Node[i].type == STORAGE) {
+            double newSurf = node_getSurfArea(i, Node[i].newDepth);
+            double oldSurf = node_getSurfArea(i, Node[i].oldDepth);
+            if (newSurf < MinSurfArea) newSurf = MinSurfArea;
+            if (oldSurf < MinSurfArea) oldSurf = MinSurfArea;
+            Xnode[i].newSurfArea = newSurf;
+            Xnode[i].oldSurfArea = oldSurf;
+        }
         if (i == 852 && copyIteration < 3000) {
-            printf("copyNodesToGpu(iter=%d): node 852 oldVol=%.6f newVol=%.6f oldDepth=%.6f newDepth=%.6f\n",
+            printf("copyNodesToGpu(iter=%d): node 852 oldVol=%.6f newVol=%.6f oldDepth=%.6f newDepth=%.6f inflow=%.6f outflow=%.6f oldNet=%.6f newSurf=%.6f fullVol=%.6f\n",
                    copyIteration, Node[i].oldVolume, Node[i].newVolume,
-                   Node[i].oldDepth, Node[i].newDepth);
+                   Node[i].oldDepth, Node[i].newDepth,
+                   Node[i].inflow, Node[i].outflow, Node[i].oldNetInflow,
+                    Xnode[i].newSurfArea, Node[i].fullVolume);
         }
         gpuNodes->h_newVolume[i]   = Node[i].newVolume;
         gpuNodes->h_oldNetInflow[i]= Node[i].oldNetInflow;
@@ -866,11 +893,20 @@ __global__ void kernel_processPumpsSequentially(
     int debugSlot = -1;
     if (logPump) {
         debugSlot = atomicAdd(&g_gpuPumpDebugCounter[k], 1);
-        int debugPrintLimit = (k == 1 || k == 22 || k == 45) ? 4000 : 5;
-        if (debugSlot < debugPrintLimit) {
+        if (debugSlot < 5) {
             double oldVolDebug = nodes->d_oldVolume[n1];
-            printf("GPU pump[%d] upstream node=%d downstream=%d oldVol=%.6f (call=%d)\n",
-                   k, n1, n2, oldVolDebug, debugSlot);
+            double newVolDebug = nodes->d_newVolume[n1];
+            double newDepthDebug = nodes->d_newDepth[n1];
+            printf("GPU pump[%d] upstream node=%d downstream=%d oldVol=%.6f newVol=%.6f newDepth=%.6f (call=%d)\n",
+                   k, n1, n2, oldVolDebug, newVolDebug, newDepthDebug, debugSlot);
+        }
+        if ((k == 22 || k == 45) &&
+            (debugSlot == 198 || debugSlot == 2275 || debugSlot == 2276)) {
+            double oldVolDebug = nodes->d_oldVolume[n1];
+            double newVolDebug = nodes->d_newVolume[n1];
+            double newDepthDebug = nodes->d_newDepth[n1];
+            printf("GPU pump[%d] critical log: oldVol=%.6f newVol=%.6f newDepth=%.6f (call=%d)\n",
+                   k, oldVolDebug, newVolDebug, newDepthDebug, debugSlot);
         }
     }
 
@@ -1505,10 +1541,20 @@ int gpu_computeConduitFlows(
             CUDA_CHECK(cudaMemcpy(d_gpuOutlets, &g_gpuOutlets, sizeof(GPU_OutletData), cudaMemcpyHostToDevice));
         }
         if (g_gpuCurves.count > 0) {
-            CUDA_CHECK(cudaMalloc(&d_gpuCurves, sizeof(GPU_CurveData)));
-            CUDA_CHECK(cudaMalloc(&d_gpuCurvePoints, sizeof(GPU_CurvePoints)));
-            CUDA_CHECK(cudaMemcpy(d_gpuCurves, &g_gpuCurves, sizeof(GPU_CurveData), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_gpuCurvePoints, &g_gpuCurvePoints, sizeof(GPU_CurvePoints), cudaMemcpyHostToDevice));
+            if (g_gpuDeviceCurves == NULL) {
+                CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurves, sizeof(GPU_CurveData)));
+            }
+            CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurves, &g_gpuCurves,
+                                  sizeof(GPU_CurveData), cudaMemcpyHostToDevice));
+
+            if (g_gpuDeviceCurvePoints == NULL) {
+                CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurvePoints, sizeof(GPU_CurvePoints)));
+            }
+            CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurvePoints, &g_gpuCurvePoints,
+                                  sizeof(GPU_CurvePoints), cudaMemcpyHostToDevice));
+
+            d_gpuCurves = g_gpuDeviceCurves;
+            d_gpuCurvePoints = g_gpuDeviceCurvePoints;
         }
         nonConduitStructuresInitialized = 1;
     }

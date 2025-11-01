@@ -18,6 +18,7 @@
 #define GPU_TABLE_HELPERS_CUH
 
 #include <cuda_runtime.h>
+#include <math.h>
 #include "gpu_structures.h"
 
 //=============================================================================
@@ -81,6 +82,104 @@ double gpu_table_lookup(
     double y2 = d_yValues[start + right];
 
     return gpu_table_interpolate(x, x1, y1, x2, y2);
+}
+
+//=============================================================================
+// Device Helper: Table Lookup with Linear Extrapolation (table_lookupEx)
+//=============================================================================
+__device__ __forceinline__
+double gpu_table_lookupEx(
+    int curveIdx,
+    double x,
+    const int* d_dataStart,
+    const int* d_dataCount,
+    const double* d_xValues,
+    const double* d_yValues)
+{
+    int start = d_dataStart[curveIdx];
+    int count = d_dataCount[curveIdx];
+
+    if (count == 0) return 0.0;
+
+    double x1 = d_xValues[start];
+    double y1 = d_yValues[start];
+
+    if (x <= x1) {
+        if (x1 > 0.0) return (x / x1) * y1;
+        return y1;
+    }
+
+    double slope = 0.0;
+    for (int idx = 1; idx < count; ++idx) {
+        double x2 = d_xValues[start + idx];
+        double y2 = d_yValues[start + idx];
+        if (x2 != x1) slope = (y2 - y1) / (x2 - x1);
+        if (x <= x2) {
+            return gpu_table_interpolate(x, x1, y1, x2, y2);
+        }
+        x1 = x2;
+        y1 = y2;
+    }
+
+    if (slope < 0.0) slope = 0.0;
+    return y1 + slope * (x - x1);
+}
+
+//=============================================================================
+// Device Helper: Storage Volume Integration (table_getStorageVolume)
+//=============================================================================
+__device__ __forceinline__
+double gpu_table_getStorageVolume(
+    int curveIdx,
+    double depth,
+    const int* d_dataStart,
+    const int* d_dataCount,
+    const double* d_xValues,
+    const double* d_yValues)
+{
+    int start = d_dataStart[curveIdx];
+    int count = d_dataCount[curveIdx];
+
+    if (count == 0) return 0.0;
+
+    double v = 0.0;
+    double x1 = d_xValues[start];
+    double a1 = d_yValues[start];
+
+    if (depth <= x1) {
+        if (x1 < 1.0e-6) return 0.0;
+        return (a1 / x1) * depth * depth * 0.5;
+    }
+
+    double dx = 0.0;
+    double dy = 0.0;
+
+    for (int idx = 1; idx < count; ++idx) {
+        double x2 = d_xValues[start + idx];
+        double a2 = d_yValues[start + idx];
+        if (x2 >= depth) {
+            double aInterp = gpu_table_interpolate(depth, x1, a1, x2, a2);
+            return v + (a1 + aInterp) * (depth - x1) * 0.5;
+        }
+        dx = x2 - x1;
+        dy = a2 - a1;
+        v += (a1 + a2) * dx * 0.5;
+        x1 = x2;
+        a1 = a2;
+    }
+
+    if (dx > 1.0e-6) {
+        double s = dy / dx;
+        double a = a1 + s * (depth - x1);
+        if (a < 0.0 && fabs(s) > 1.0e-12) {
+            v = v - a1 * a1 / (2.0 * s);
+        }
+        else {
+            v = v + (a1 + a) * (depth - x1) * 0.5;
+        }
+    }
+
+    return v;
 }
 
 //=============================================================================

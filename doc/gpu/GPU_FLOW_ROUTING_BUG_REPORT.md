@@ -20,6 +20,46 @@ The GPU implementation of dynamic wave flow routing produces **completely incorr
 
 ---
 
+## Status Update – Session68 Pump Regression (2025-10-27)
+
+Recent debugging focused on the `Session68_46_pumps_15min.inp` stress test to explain the long‑standing CPU/GPU divergence.
+
+- **New implementation work**
+  - GPU node transfers now include full storage geometry (`a0/a1/a2`, shape id, storage curve id) plus tabular curve metadata.
+  - `gpu_storage_getVolume` mirrors the CPU `storage_getVolume`, using device table helpers to evaluate tabular shapes instead of the previous linear placeholder.
+  - The node-depth kernel now feeds unit conversion factors and curve tables into the storage helper so every storage node uses real geometry when computing volume and flooding behavior.
+  - Curve metadata (`GPU_CurveData/GPU_CurvePoints`) is allocated once during non‑conduit initialization and reused by both conduit and node kernels.
+
+- **Continuity comparison (runswmm built at commit HEAD)**
+
+  | Engine | Flow-routing continuity error | Final stored volume (10⁶ gal) | Flooding loss (10⁶ gal) |
+  |--------|------------------------------|-------------------------------|-------------------------|
+  | CPU (`SWMM_USE_CUDA=0`) | −29.785 % | 0.044 | 0.000 |
+  | GPU (`SWMM_USE_CUDA=1 SWMM_FORCE_CUDA=1`) | −8.131 % | 0.037 | 0.001 |
+
+  The GPU result improved slightly after wiring storage geometry but still deviates from the CPU reference and exhibits large node-level continuity spikes.
+
+- **First timestep where GPU storage collapses**
+  - During routing step 110 (Picard iteration 0/1, `dt ≈ 8.922 s`), node 852’s volume drops from 0.128 ft³ to **0.000 ft³** immediately after `kernel_findNodeDepths`.
+  - The relevant log fragment (`/tmp/gpu_run.log`, line ≈ 10 780) shows:
+
+    ```
+    copyNodesToGpu(iter=1098): node 852 oldVol=0.127629 newVol=0.127629 ...
+    GPU kernel_findNodeDepths: dt = 8.922000, steps = 0
+    copyNodesFromGpu: node 852 newVolume=0.000000 newDepth=0.000000 overflow=0.000000
+    ```
+
+  - The follow-up pump pass immediately clamps `getMaxOutflow` to zero (`qMax=0.000000`), which keeps the upstream wet well dry for all remaining timesteps.
+
+- **Outstanding issues**
+  - `gpu_node_getMaxOutflow` still sees `oldVol=0` once node 852 collapses, so every pump call continues to zero the flow even though the CPU run keeps ~0.03 cfs available.
+  - We need additional instrumentation inside `gpu_storage_getVolume` / `gpu_setNodeDepth` to verify the intermediate depth→volume mapping for the timestep that collapses the node.
+  - Compare the device-side `oldVolume`/`inflow` arrays against CPU values right before the collapse to understand why the GPU volume underflows while the CPU retains ~0.128 ft³.
+
+See `/tmp/gpu_run.log` for the full CUDA debug trace of the latest run.
+
+---
+
 ## Test Infrastructure
 
 Created 6 individual test cases in `/tests/gpu/` directory to isolate and verify each issue:
@@ -700,4 +740,3 @@ grep -B 5 -A 30 "dq2.*energy" src/solver/dwflow.c
 | **Performance** | 147x slower than CPU (no benefit) |
 | **Fix Complexity** | Moderate - need to add pump/weir handling to GPU kernel |
 | **Test Reproducibility** | 100% - every run shows same issues |
-
