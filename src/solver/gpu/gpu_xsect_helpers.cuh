@@ -137,6 +137,20 @@ __device__ double gpu_getSlotWidth(
 
 //=============================================================================
 
+__device__ double gpu_circular_getWofY(double y, double d)
+//
+//  Purpose: Computes top width for circular section
+//
+{
+    if (y <= 0.0) return 0.0;
+    if (y >= d) return d;
+
+    double theta = 2.0 * acos(1.0 - 2.0 * y / d);
+    return d * sin(theta / 2.0);
+}
+
+//=============================================================================
+
 __device__ double gpu_circular_getAofY(double y, double d)
 //
 //  Purpose: Computes area for circular cross-section
@@ -175,6 +189,16 @@ __device__ double gpu_circular_getRofY(double y, double d)
     w = d * sin(theta / 2.0);
 
     return (w > 0.0) ? a / w : 0.0;
+}
+
+//=============================================================================
+
+__device__ double gpu_rect_getWofY(double /*y*/, double w)
+//
+//  Purpose: Returns top width for rectangular cross-section
+//
+{
+    return (w > 0.0) ? w : 0.0;
 }
 
 //=============================================================================
@@ -218,6 +242,17 @@ __device__ double gpu_rect_getRofY(double y, double w, double h)
 
 //=============================================================================
 
+__device__ double gpu_trapezoidal_getWofY(double y, double b, double s)
+//
+//  Purpose: Returns top width for trapezoidal section
+//
+{
+    if (y <= 0.0) return b;
+    return b + 2.0 * s * y;
+}
+
+//=============================================================================
+
 __device__ double gpu_trapezoidal_getAofY(double y, double b, double s)
 //
 //  Purpose: Computes area for trapezoidal cross-section
@@ -250,6 +285,56 @@ __device__ double gpu_trapezoidal_getRofY(double y, double b, double s)
     p = b + 2.0 * y * sqrt(1.0 + s * s);
 
     return (p > 0.0) ? a / p : 0.0;
+}
+
+//=============================================================================
+
+__device__ double gpu_xsect_getWofY(GPU_Xsect* xsect, double y)
+//
+//  Purpose: Computes top width for supported shapes
+//
+{
+    if (y <= 0.0) return 0.0;
+
+    switch (xsect->type) {
+        case GPU_CIRCULAR:
+        case GPU_FILLED_CIRCULAR:
+            return gpu_circular_getWofY(y, xsect->geom1);
+
+        case GPU_RECT_CLOSED:
+        case GPU_RECT_OPEN:
+            return gpu_rect_getWofY(y, xsect->geom1);
+
+        case GPU_TRAPEZOIDAL:
+            return gpu_trapezoidal_getWofY(y, xsect->geom1, xsect->geom2);
+
+        case GPU_TRIANGULAR:
+            return gpu_trapezoidal_getWofY(y, 0.0, xsect->geom1);
+
+        default:
+            // Linear approximation for unsupported shapes
+            return xsect->wMax * (y / xsect->yFull);
+    }
+}
+
+//=============================================================================
+
+__device__ double gpu_getWidth(
+    GPU_Xsect* xsect,
+    double y,
+    int surchargeMethod,
+    double crownCutoff)
+//
+//  Purpose: Computes effective top width including slot when surcharged
+//
+{
+    double wSlot = gpu_getSlotWidth(xsect, y, surchargeMethod, crownCutoff);
+    if (wSlot > 0.0) return wSlot;
+
+    if ((y / xsect->yFull) >= crownCutoff && !gpu_xsect_isOpen(xsect->type)) {
+        y = crownCutoff * xsect->yFull;
+    }
+    return gpu_xsect_getWofY(xsect, y);
 }
 
 //=============================================================================

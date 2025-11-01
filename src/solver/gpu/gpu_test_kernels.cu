@@ -49,9 +49,9 @@ __global__ void test_initNodeDepths(GPU_NodeData* nodes)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < nodes->count) {
-        nodes->newDepth[i] = nodes->oldDepth[i];
-        nodes->newVolume[i] = nodes->oldVolume[i];
-        nodes->converged[i] = 0;  // FALSE
+        nodes->d_newDepth[i] = nodes->d_oldDepth[i];
+        nodes->d_newVolume[i] = nodes->d_oldVolume[i];
+        nodes->d_converged[i] = 0;  // FALSE
     }
 }
 
@@ -68,9 +68,9 @@ __global__ void test_initLinkFlows(GPU_LinkData* links)
 {
     int i = blockIdx.x * blockDim.x * threadIdx.x;
     if (i < links->count) {
-        links->newFlow[i] = links->oldFlow[i];
-        links->newDepth[i] = links->oldDepth[i];
-        links->newVolume[i] = links->oldVolume[i];
+        links->h_newFlow[i] = links->h_oldFlow[i];
+        links->h_newDepth[i] = links->h_oldDepth[i];
+        links->h_newVolume[i] = links->h_oldVolume[i];
     }
 }
 
@@ -90,14 +90,14 @@ __global__ void test_computeNodeBalance(GPU_NodeData* nodes, double dt)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < nodes->count) {
-        double dV = (nodes->inflow[i] - nodes->outflow[i]) * dt;
-        nodes->newVolume[i] = nodes->oldVolume[i] + dV;
+        double dV = (nodes->d_inflow[i] - nodes->d_outflow[i]) * dt;
+        nodes->d_newVolume[i] = nodes->d_oldVolume[i] + dV;
 
         // Simple depth calculation (assuming constant surface area for testing)
-        double surfArea = nodes->newSurfArea[i];
+        double surfArea = nodes->d_newSurfArea[i];
         if (surfArea > 0.0) {
             double dDepth = dV / surfArea;
-            nodes->newDepth[i] = nodes->oldDepth[i] + dDepth;
+            nodes->d_newDepth[i] = nodes->d_oldDepth[i] + dDepth;
         }
     }
 }
@@ -116,13 +116,13 @@ __global__ void test_checkConvergence(GPU_NodeData* nodes, double tol, int* conv
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < nodes->count) {
-        double depthChange = fabs(nodes->newDepth[i] - nodes->oldDepth[i]);
+        double depthChange = fabs(nodes->d_newDepth[i] - nodes->d_oldDepth[i]);
 
         if (depthChange < tol) {
-            nodes->converged[i] = 1;  // TRUE
+            nodes->d_converged[i] = 1;  // TRUE
             atomicAdd(convergedCount, 1);
         } else {
-            nodes->converged[i] = 0;  // FALSE
+            nodes->d_converged[i] = 0;  // FALSE
         }
     }
 }
@@ -238,11 +238,11 @@ int gpu_test_nodeStructure(int nodeCount)
 
     // Initialize test data on CPU (works with unified memory)
     for (int i = 0; i < nodeCount; i++) {
-        nodes.oldDepth[i] = (double)i * 0.5;
-        nodes.oldVolume[i] = (double)i * 10.0;
-        nodes.inflow[i] = 5.0;
-        nodes.outflow[i] = 3.0;
-        nodes.newSurfArea[i] = 100.0;
+        nodes.d_oldDepth[i] = (double)i * 0.5;
+        nodes.d_oldVolume[i] = (double)i * 10.0;
+        nodes.d_inflow[i] = 5.0;
+        nodes.d_outflow[i] = 3.0;
+        nodes.d_newSurfArea[i] = 100.0;
     }
 
     // If discrete GPU, copy to device
@@ -261,9 +261,9 @@ int gpu_test_nodeStructure(int nodeCount)
 
     // Verify results
     for (int i = 0; i < nodeCount; i++) {
-        if (fabs(nodes.newDepth[i] - nodes.oldDepth[i]) > 1e-10) {
+        if (fabs(nodes.d_newDepth[i] - nodes.d_oldDepth[i]) > 1e-10) {
             printf("ERROR at node %d: newDepth=%.2f, oldDepth=%.2f\n",
-                   i, nodes.newDepth[i], nodes.oldDepth[i]);
+                   i, nodes.d_newDepth[i], nodes.d_oldDepth[i]);
             errors++;
             if (errors > 10) break;
         }
@@ -302,11 +302,11 @@ int gpu_test_massBalance(int nodeCount)
     }
 
     for (int i = 0; i < nodeCount; i++) {
-        nodes.oldDepth[i] = 1.0;
-        nodes.oldVolume[i] = 100.0;
-        nodes.inflow[i] = 10.0;   // 10 cfs inflow
-        nodes.outflow[i] = 5.0;   // 5 cfs outflow
-        nodes.newSurfArea[i] = 100.0;  // 100 ft2 surface area
+        nodes.d_oldDepth[i] = 1.0;
+        nodes.d_oldVolume[i] = 100.0;
+        nodes.d_inflow[i] = 10.0;   // 10 cfs inflow
+        nodes.d_outflow[i] = 5.0;   // 5 cfs outflow
+        nodes.d_newSurfArea[i] = 100.0;  // 100 ft2 surface area
     }
 
     // Launch kernel
@@ -319,10 +319,10 @@ int gpu_test_massBalance(int nodeCount)
 
     // Verify: newVolume should be oldVolume + (10-5)*1 = oldVolume + 5
     for (int i = 0; i < nodeCount; i++) {
-        double expected = nodes.oldVolume[i] + 5.0;
-        if (fabs(nodes.newVolume[i] - expected) > 1e-6) {
+        double expected = nodes.d_oldVolume[i] + 5.0;
+        if (fabs(nodes.d_newVolume[i] - expected) > 1e-6) {
             printf("ERROR at node %d: expected volume=%.2f, got=%.2f\n",
-                   i, expected, nodes.newVolume[i]);
+                   i, expected, nodes.d_newVolume[i]);
             errors++;
             if (errors > 10) break;
         }

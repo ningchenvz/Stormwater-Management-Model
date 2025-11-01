@@ -1051,11 +1051,22 @@ static void swmm_gpu_configure_runtime(void)
         snprintf(envSuffix, sizeof(envSuffix), " [SWMM_USE_CUDA=%s]", envValue);
     }
 
+    const char* forceEnv = getenv("SWMM_FORCE_CUDA");
+    const int forceSetting = swmm_gpu_parse_env(forceEnv);
+    const int forceCuda = (forceSetting == 1);
+    char forceSuffix[64] = "";
+    if (forceEnv && forceEnv[0]) {
+        snprintf(forceSuffix, sizeof(forceSuffix), " [SWMM_FORCE_CUDA=%s]", forceEnv);
+    }
+    g_gpuConfig.forceCuda = forceCuda;
+
     const int hwReady = (g_gpuConfig.available && g_gpuConfig.enabled);
     const int supportsRouting = (DoRouting && RouteModel == DW);
     const int sizeOk =
         (Nobjects[LINK] >= g_gpuConfig.minLinksForGPU &&
          Nobjects[NODE] >= g_gpuConfig.minNodesForGPU);
+    const int conduitCount = Nlinks[CONDUIT];
+    const int conduitCountOk = (conduitCount >= g_gpuConfig.minConduitsForGPU);
 
     char reason[192] = "";
     if (envSetting == 0) {
@@ -1068,11 +1079,24 @@ static void swmm_gpu_configure_runtime(void)
         snprintf(reason, sizeof(reason),
                  "CUDA path currently supports Dynamic Wave routing only");
     }
-    else if (envSetting == 1) {
+    else if (forceCuda) {
         g_gpuConfig.useCuda = 1;
     }
+    else if (envSetting == 1) {
+        if (conduitCountOk) g_gpuConfig.useCuda = 1;
+        else {
+            snprintf(reason, sizeof(reason),
+                     "conduit count %d below GPU heuristic (need >=%d or set SWMM_FORCE_CUDA=1)",
+                     conduitCount, g_gpuConfig.minConduitsForGPU);
+        }
+    }
     else if (sizeOk) {
-        g_gpuConfig.useCuda = 1;
+        if (conduitCountOk) g_gpuConfig.useCuda = 1;
+        else {
+            snprintf(reason, sizeof(reason),
+                     "conduit count %d below GPU heuristic (need >=%d or set SWMM_FORCE_CUDA=1)",
+                     conduitCount, g_gpuConfig.minConduitsForGPU);
+        }
     }
     else {
         snprintf(reason, sizeof(reason),
@@ -1085,8 +1109,9 @@ static void swmm_gpu_configure_runtime(void)
     if (g_gpuConfig.useCuda) {
         gpu_profiler_reset();
         snprintf(msg, sizeof(msg),
-                 "\n ... CUDA acceleration enabled%s (device %d, compute %d.%d, unified memory: %s)",
+                 "\n ... CUDA acceleration enabled%s%s (device %d, compute %d.%d, unified memory: %s)",
                  envSuffix,
+                 forceCuda ? forceSuffix : "",
                  g_gpuConfig.activeDevice,
                  g_gpuConfig.computeCapability / 10,
                  g_gpuConfig.computeCapability % 10,
@@ -1099,8 +1124,9 @@ static void swmm_gpu_configure_runtime(void)
         int maxReasonLen = (int)sizeof(reason) - 1;
         if (maxReasonLen > 200) maxReasonLen = 200;
         snprintf(msg, sizeof(msg),
-                 "\n ... CUDA acceleration disabled%s (%.*s)",
+                 "\n ... CUDA acceleration disabled%s%s (%.*s)",
                  envSuffix,
+                 forceCuda ? forceSuffix : "",
                  maxReasonLen,
                  reason);
     }

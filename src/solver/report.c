@@ -60,7 +60,8 @@
 //-----------------------------------------------------------------------------
 //  Shared variables
 //-----------------------------------------------------------------------------
-static time_t SysTime;
+static time_t  SysTime;
+static clock_t SysClock;
 
 //-----------------------------------------------------------------------------
 //  Imported variables
@@ -189,6 +190,7 @@ void report_writeSysTime(void)
 {
     char    theTime[9];
     double  elapsedTime;
+    double  elapsedMs;
     time_t  endTime;
     if ( Frpt.file )
     {
@@ -196,8 +198,13 @@ void report_writeSysTime(void)
         time(&endTime);
         fprintf(Frpt.file, FMT20a, ctime(&endTime));
         elapsedTime = difftime(endTime, SysTime);
+        elapsedMs = 1000.0 * (double)(clock() - SysClock) / (double)CLOCKS_PER_SEC;
         fprintf(Frpt.file, FMT21);
-        if ( elapsedTime < 1.0 ) fprintf(Frpt.file, "< 1 sec");
+        if ( elapsedTime < 1.0 )
+        {
+            if (elapsedMs < 1.0) fprintf(Frpt.file, "< 1 ms");
+            else fprintf(Frpt.file, "%.3f sec", elapsedMs / 1000.0);
+        }
         else
         {
             elapsedTime /= SECperDAY;
@@ -228,6 +235,7 @@ void report_writeLogo()
     fprintf(Frpt.file, FMT09);
     fprintf(Frpt.file, FMT10);
     time(&SysTime);                    // Save starting wall clock time
+    SysClock = clock();
 }
 
 //=============================================================================

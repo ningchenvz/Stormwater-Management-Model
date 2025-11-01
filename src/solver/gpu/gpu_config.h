@@ -58,8 +58,11 @@ extern "C" {
 #define MAX_THREADS_PER_BLOCK 1024
 
 // Minimum model size to use GPU (overhead not worth it for small models)
-#define GPU_MIN_LINKS_DEFAULT 500
-#define GPU_MIN_NODES_DEFAULT 500
+#define GPU_MIN_LINKS_DEFAULT     500
+#define GPU_MIN_NODES_DEFAULT     500
+#define GPU_MIN_CONDUITS_DEFAULT  750
+#define GPU_MAX_KERNEL_MS_DEFAULT     5000.0
+#define GPU_MAX_TOTAL_KERNEL_MS_DEFAULT 5000.0
 
 // GPU memory alignment
 #define GPU_MEMORY_ALIGNMENT 256
@@ -82,8 +85,12 @@ typedef struct {
     int warpSize;               // Warp size (typically 32)
     int minLinksForGPU;         // Minimum links to use GPU
     int minNodesForGPU;         // Minimum nodes to use GPU
+    int minConduitsForGPU;      // Minimum true conduits to justify GPU
+    int forceCuda;              // SWMM_FORCE_CUDA override flag
     int unifiedMemory;          // Supports unified memory (managed memory)
     int concurrentManagedAccess;// Can access managed memory concurrently from CPU/GPU
+    double maxKernelTimeMs;     // Threshold to disable GPU if kernel too slow
+    double maxTotalKernelTimeMs;// Disable if cumulative kernel time exceeds limit
 } GPUConfig;
 
 typedef struct {
@@ -105,6 +112,7 @@ extern GPUPerfStats g_gpuPerfStats;
     int gpu_isEnabled(void);
     void gpu_setEnabled(int enabled);
     void gpu_printInfo(void);
+    cudaStream_t gpu_getStream(void);
 
     // GPU test functions
     int gpu_runAllTests(void);

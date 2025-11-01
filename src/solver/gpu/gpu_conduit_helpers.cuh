@@ -55,6 +55,92 @@ __device__ inline double gpu_MIN(double a, double b)
 // Sign function
 #define GPU_SGN(x) ((x) < 0 ? -1 : 1)
 
+__device__ inline int gpu_classifyFlow(double y1, double y2)
+{
+    if (y1 <= GPU_FUDGE && y2 <= GPU_FUDGE) return GPU_DRY;
+    if (y1 <= GPU_FUDGE) return GPU_UP_DRY;
+    if (y2 <= GPU_FUDGE) return GPU_DN_DRY;
+    return GPU_SUBCRITICAL;
+}
+
+__device__ void gpu_computeSurfaceAreas(
+    GPU_Xsect* xsect,
+    double length,
+    double offset1,
+    double offset2,
+    double y1,
+    double y2,
+    int flowClass,
+    int surchargeMethod,
+    double crownCutoff,
+    double* surfArea1_out,
+    double* surfArea2_out)
+//
+//  Purpose: Approximates conduit surface area contribution at each node
+//
+{
+    double surfArea1 = 0.0;
+    double surfArea2 = 0.0;
+
+    double flowDepth1 = gpu_MAX(y1, GPU_FUDGE);
+    double flowDepth2 = gpu_MAX(y2, GPU_FUDGE);
+    double flowDepthMid = 0.5 * (flowDepth1 + flowDepth2);
+    flowDepthMid = gpu_MAX(flowDepthMid, GPU_FUDGE);
+
+    double width1 = gpu_getWidth(xsect, flowDepth1, surchargeMethod, crownCutoff);
+    double width2 = gpu_getWidth(xsect, flowDepth2, surchargeMethod, crownCutoff);
+    double widthMid = gpu_getWidth(xsect, flowDepthMid, surchargeMethod, crownCutoff);
+
+    switch (flowClass)
+    {
+        case GPU_DRY:
+            surfArea1 = GPU_FUDGE * length * 0.5;
+            surfArea2 = surfArea1;
+            break;
+
+        case GPU_UP_DRY:
+            flowDepth1 = GPU_FUDGE;
+            width1 = gpu_getWidth(xsect, flowDepth1, surchargeMethod, crownCutoff);
+            flowDepthMid = gpu_MAX(0.5 * (flowDepth1 + flowDepth2), GPU_FUDGE);
+            widthMid = gpu_getWidth(xsect, flowDepthMid, surchargeMethod, crownCutoff);
+            surfArea2 = (widthMid + width2) * length * 0.25;
+            if (offset1 <= 0.0)
+            {
+                surfArea1 = (width1 + widthMid) * length * 0.25;
+            }
+            else
+            {
+                surfArea1 = GPU_FUDGE * length * 0.25;
+            }
+            break;
+
+        case GPU_DN_DRY:
+            flowDepth2 = GPU_FUDGE;
+            width2 = gpu_getWidth(xsect, flowDepth2, surchargeMethod, crownCutoff);
+            flowDepthMid = gpu_MAX(0.5 * (flowDepth1 + flowDepth2), GPU_FUDGE);
+            widthMid = gpu_getWidth(xsect, flowDepthMid, surchargeMethod, crownCutoff);
+            surfArea1 = (width1 + widthMid) * length * 0.25;
+            if (offset2 <= 0.0)
+            {
+                surfArea2 = (width2 + widthMid) * length * 0.25;
+            }
+            else
+            {
+                surfArea2 = GPU_FUDGE * length * 0.25;
+            }
+            break;
+
+        default:
+            // Treat subcritical/supercritical the same for surface area
+            surfArea1 = (width1 + widthMid) * length * 0.25;
+            surfArea2 = (widthMid + width2) * length * 0.25;
+            break;
+    }
+
+    *surfArea1_out = surfArea1;
+    *surfArea2_out = surfArea2;
+}
+
 //=============================================================================
 
 __device__ double gpu_link_getFroude(
@@ -102,7 +188,6 @@ __device__ void gpu_findConduitFlow_simplified(
     double offset1,
     double offset2,
     double oldFlow,
-    int flowClass,
     // Conduit data
     double barrels,
     double modLength,
@@ -121,7 +206,10 @@ __device__ void gpu_findConduitFlow_simplified(
     double* aMid_out,           // mid-conduit area
     double* yMid_out,           // mid-conduit depth
     double* dqdh_out,           // derivative of flow w.r.t. head
-    double* froude_out)         // Froude number
+    double* froude_out,         // Froude number
+    double* surfArea1_out,      // upstream surface area contribution
+    double* surfArea2_out,      // downstream surface area contribution
+    int* flowClass_out)         // updated flow class
 //
 //  Purpose: Simplified GPU version of dwflow_findConduitFlow
 //  Note: This is Stage 1 implementation - regular conduits only
@@ -147,6 +235,7 @@ __device__ void gpu_findConduitFlow_simplified(
     double q;                   // new flow
     double froude;              // Froude number
     int isFull;                 // TRUE if flowing full
+    int flowClassLocal;         // Simplified flow classification
 
     // Get flow from last time step & previous iteration
     qOld = oldFlow / barrels;
@@ -171,6 +260,8 @@ __device__ void gpu_findConduitFlow_simplified(
         y1 = gpu_MIN(y1, xsect->yFull);
         y2 = gpu_MIN(y2, xsect->yFull);
     }
+
+    flowClassLocal = gpu_classifyFlow(y1, y2);
 
     // Get area from previous time step
     aOld = a2_old;
@@ -217,6 +308,10 @@ __device__ void gpu_findConduitFlow_simplified(
 
     // Compute Froude number
     froude = gpu_link_getFroude(v, yMid, xsect->aFull);
+    if (froude > 1.0 && flowClassLocal == GPU_SUBCRITICAL)
+    {
+        flowClassLocal = GPU_SUPCRITICAL;
+    }
 
     // Find inertial damping factor (sigma)
     if (froude <= 0.5) sigma = 1.0;
@@ -256,12 +351,6 @@ __device__ void gpu_findConduitFlow_simplified(
     denom = 1.0 + dq1;  // Simplified: no local losses in Stage 1
     q = (qOld - dq2 + dq3 + dq4) / denom;
 
-    // DEBUG: Print momentum equation terms for first conduit on first iteration
-    if (j == 0 && steps == 0) {
-        printf("MOMENTUM DEBUG: h1=%.3f h2=%.3f dq2=%.6f qOld=%.6f denom=%.3f q=%.6f\n",
-               h1, h2, dq2, qOld, denom, q);
-    }
-
     // Compute derivative of flow w.r.t. head
     *dqdh_out = 1.0 / denom * GPU_GRAVITY * dt * aWtd / length * barrels;
 
@@ -280,7 +369,25 @@ __device__ void gpu_findConduitFlow_simplified(
     *q_out = q;
     *aMid_out = aMid;
     *yMid_out = gpu_MIN(yMid, xsect->yFull);
+    double surfArea1 = 0.0;
+    double surfArea2 = 0.0;
+    gpu_computeSurfaceAreas(
+        xsect,
+        length,
+        offset1,
+        offset2,
+        y1,
+        y2,
+        flowClassLocal,
+        surchargeMethod,
+        crownCutoff,
+        &surfArea1,
+        &surfArea2);
+
     *froude_out = froude;
+    *surfArea1_out = surfArea1;
+    *surfArea2_out = surfArea2;
+    *flowClass_out = flowClassLocal;
 }
 
 #endif // GPU_CONDUIT_HELPERS_CUH
