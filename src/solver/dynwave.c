@@ -79,11 +79,25 @@ int gpu_computeConduitFlows(
     double crownCutoff,
     int inertDamping);
 
+void gpu_flushConduitResults(void);
+int gpu_initializeNonConduitData(void);
+void gpu_freeNonConduitData(void);
+
 // External GPU data structures (assumed to be allocated/managed elsewhere)
 extern GPU_LinkData g_gpuLinks;
 extern GPU_ConduitData g_gpuConduits;
 extern GPU_XsectData g_gpuXsects;
 extern GPU_NodeData g_gpuNodes;
+
+// Non-conduit link data structures
+extern GPU_PumpData g_gpuPumps;
+extern GPU_OrificeData g_gpuOrifices;
+extern GPU_WeirData g_gpuWeirs;
+extern GPU_OutletData g_gpuOutlets;
+
+// Curve data for pumps and outlets
+extern GPU_CurveData g_gpuCurves;
+extern GPU_CurvePoints g_gpuCurvePoints;
 #endif
 
 //-----------------------------------------------------------------------------
@@ -181,6 +195,18 @@ void dynwave_init()
     // --- set crown cutoff for finding top width of closed conduits
     if ( SurchargeMethod == SLOT ) CrownCutoff = SLOT_CROWN_CUTOFF;
     else                           CrownCutoff = EXTRAN_CROWN_CUTOFF;
+
+#ifdef BUILD_GPU
+    // --- initialize GPU data for non-conduit links if GPU is enabled
+    if (g_gpuConfig.useCuda && (Nlinks[PUMP] > 0 || Nlinks[ORIFICE] > 0 ||
+                                 Nlinks[WEIR] > 0 || Nlinks[OUTLET] > 0))
+    {
+        if (gpu_initializeNonConduitData() != 0) {
+            printf("\n  WARNING: Failed to initialize GPU non-conduit data, disabling GPU\n");
+            g_gpuConfig.useCuda = 0;
+        }
+    }
+#endif
 }
 
 //=============================================================================
@@ -192,6 +218,9 @@ void  dynwave_close()
 //  Purpose: frees memory allocated for dynamic wave routing method.
 //
 {
+#ifdef BUILD_GPU
+    gpu_freeNonConduitData();
+#endif
     FREE(Xnode);
 }
 
@@ -261,7 +290,53 @@ int dynwave_execute(double tStep)
     Omega = OMEGA;
     initRoutingStep();
 
-    // --- keep iterating until convergence 
+#ifdef BUILD_GPU
+    // --- GPU-accelerated path: Persistent Picard iteration
+    //     Keeps convergence checking on GPU to minimize CPU-GPU transfers
+    //     Expected speedup: 2-5x for Picard iterations
+    if ( g_gpuConfig.useCuda )
+    {
+        int gpuIterations = 0;
+        int gpuConverged = 0;
+
+        // Initialize node states once before GPU Picard loop
+        initNodeStates();
+
+        // Run link flows on CPU first (GPU link flows not yet implemented)
+        findLinkFlows(tStep);
+
+        // Execute entire Picard iteration loop on GPU
+        int gpuResult = gpu_runPersistentPicardIteration(
+            tStep,
+            AllowPonding,
+            SurchargeMethod,
+            MinSurfArea,
+            Omega,
+            HeadTol,
+            MaxTrials,
+            &gpuIterations,
+            &gpuConverged);
+
+        if ( gpuResult == 0 )
+        {
+            // GPU path succeeded
+            Steps = gpuIterations;
+            converged = gpuConverged;
+
+            if ( !converged ) updateConvergenceStats();
+
+            // Skip CPU Picard loop - already done on GPU
+            goto gpu_path_complete;
+        }
+        else
+        {
+            // GPU path failed - fall back to CPU
+            printf("WARNING: GPU Picard iteration failed, falling back to CPU\n");
+        }
+    }
+#endif
+
+    // --- CPU path: keep iterating until convergence
     while ( Steps < MaxTrials )
     {
         // --- execute a routing step & check for nodal convergence
@@ -278,6 +353,14 @@ int dynwave_execute(double tStep)
         }
     }
     if ( !converged ) updateConvergenceStats();
+
+#ifdef BUILD_GPU
+gpu_path_complete:
+#endif
+
+#ifdef BUILD_GPU
+    if (g_gpuConfig.useCuda) gpu_flushConduitResults();
+#endif
 
     //  --- identify any capacity-limited conduits
     findLimitedLinks();
@@ -425,7 +508,19 @@ void findLinkFlows(double dt)
             InertDamping);
 
         // If GPU succeeded, return (node flows already updated by GPU)
-        if (gpuResult == 0) return;
+        if (gpuResult == 0)
+        {
+            // --- still need to process non-conduit links on CPU
+            for (i = 0; i < Nobjects[LINK]; i++)
+            {
+                if ( !isTrueConduit(i) )
+                {
+                    if ( !Link[i].bypassed ) findNonConduitFlow(i, dt);
+                    updateNodeFlows(i);
+                }
+            }
+            return;
+        }
 
         // Otherwise fall through to CPU path
     }
@@ -641,7 +736,7 @@ void updateNodeFlows(int i)
 int findNodeDepths(double dt)
 //
 //  Input:   dt = time step (sec)
-//  Output:  returns TRUE if depth change at all non-Outfall nodes is 
+//  Output:  returns TRUE if depth change at all non-Outfall nodes is
 //           within the convergence tolerance and FALSE otherwise
 //  Purpose: finds new depth at all nodes and checks if convergence achieved.
 //
@@ -653,9 +748,7 @@ int findNodeDepths(double dt)
     for ( i = 0; i < Nobjects[LINK]; i++ ) link_setOutfallDepth(i);
 
 #ifdef BUILD_GPU
-    // TEMPORARY: Disable GPU node depth kernel to debug conduit kernel
-    // Use CPU for node depths, GPU only for conduit flows
-    /*
+    // --- GPU-only path: no CPU fallback
     if (g_gpuConfig.useCuda)
     {
         int gpuConverged = gpu_runNodeDepthKernel(
@@ -666,19 +759,27 @@ int findNodeDepths(double dt)
             Steps,
             Omega,
             HeadTol);
-        if (gpuConverged >= 0)
+
+        if (gpuConverged < 0)
         {
-            for (i = 0; i < Nobjects[NODE]; i++)
-            {
-                if ( Node[i].type == OUTFALL ) continue;
-                if (Xnode[i].converged == FALSE) return FALSE;
-            }
-            return TRUE;
+            // GPU kernel failed - report error and abort
+            report_writeErrorMsg(ERR_SYSTEM,
+                "GPU node depth kernel failed. Aborting simulation.");
+            ErrorCode = ERR_SYSTEM;
+            return FALSE;
         }
+
+        // GPU succeeded - check convergence
+        for (i = 0; i < Nobjects[NODE]; i++)
+        {
+            if ( Node[i].type == OUTFALL ) continue;
+            if (Xnode[i].converged == FALSE) return FALSE;
+        }
+        return TRUE;
     }
-    */
 #endif
 
+    // --- CPU path (only when GPU is disabled)
     // --- compute new depth for all non-outfall nodes and determine if
     //     depth change from previous iteration is below tolerance
 #pragma omp parallel num_threads(NumThreads)
