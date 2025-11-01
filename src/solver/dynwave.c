@@ -515,24 +515,15 @@ void findLinkFlows(double dt)
             crownCutoff,
             InertDamping);
 
-        // Handle GPU results:
-        // gpuResult == 0: ALL link types processed by GPU, return early
-        // gpuResult == 1: Only conduits processed by GPU, CPU handles non-conduits below
-        // gpuResult < 0: GPU error, fall through to full CPU path
+        // If GPU succeeded, return (ALL links and node flows already updated by GPU)
         if (gpuResult == 0)
         {
             // GPU has processed ALL link types (conduits, pumps, orifices, weirs, outlets)
-            // and updated node flows - nothing more to do
+            // and updated node flows via sequential pump processing
             return;
         }
-        else if (gpuResult == 1)
-        {
-            // GPU processed conduits only, skip to CPU non-conduit processing
-            // Node flows for conduits already updated by GPU
-            goto process_non_conduits;
-        }
 
-        // Otherwise fall through to full CPU path (gpuResult < 0 indicates error)
+        // Otherwise fall through to CPU path (gpuResult < 0 indicates GPU error)
     }
 #endif
 
@@ -553,7 +544,6 @@ void findLinkFlows(double dt)
         if ( isTrueConduit(i) ) updateNodeFlows(i);
     }
 
-process_non_conduits:
     // --- find new flows for all dummy conduits, pumps & regulators
     for ( i = 0; i < Nobjects[LINK]; i++)
     {

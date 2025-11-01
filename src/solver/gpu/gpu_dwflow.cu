@@ -1547,28 +1547,16 @@ int gpu_computeConduitFlows(
         CUDA_CHECK_LAST_ERROR();
     }
 
-    // Track whether non-conduits were processed on GPU
-    bool nonConduitsProcessedOnGPU = false;
-
-    // PUMP PROCESSING: Currently disabled for debugging
+    // PUMP PROCESSING: ENABLED - Process pumps on GPU
     // FULLY SEQUENTIAL PUMP PROCESSING (Exact CPU Logic)
     // Process each pump: compute flow → getModPumpFlow → update nodes → next pump
     // This matches CPU behavior EXACTLY where each pump sees previous pumps' effects
-    if (false && Nlinks[PUMP] > 0 && g_gpuPumps.count > 0) {
+    if (Nlinks[PUMP] > 0 && g_gpuPumps.count > 0) {
         kernel_processPumpsSequentially<<<1, 1, 0, stream>>>(
             d_links, d_gpuPumps, d_nodes, d_gpuCurves, d_gpuCurvePoints,
             dt, routeModel,
             ucfVolume, ucfLength, ucfFlow);
         CUDA_CHECK_LAST_ERROR();
-        nonConduitsProcessedOnGPU = true;
-    }
-
-    // Similarly track if weirs/orifices/outlets are enabled
-    // Since they ARE currently enabled, mark as processed
-    if ((Nlinks[ORIFICE] > 0 && g_gpuOrifices.count > 0) ||
-        (Nlinks[WEIR] > 0 && g_gpuWeirs.count > 0) ||
-        (Nlinks[OUTLET] > 0 && g_gpuOutlets.count > 0)) {
-        nonConduitsProcessedOnGPU = true;
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1735,13 +1723,8 @@ int gpu_computeConduitFlows(
     }
     // --- END DEBUG
 
-    // Return 0 if ALL link types processed on GPU
-    // Return 1 if only conduits processed (CPU needs to handle non-conduits)
-    if (nonConduitsProcessedOnGPU) {
-        return 0;  // Success - all link types handled by GPU
-    } else {
-        return 1;  // Partial success - only conduits processed, CPU should handle non-conduits
-    }
+    // All link types processed on GPU
+    return 0;
 }
 
 } // extern "C"
