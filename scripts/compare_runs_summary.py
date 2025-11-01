@@ -10,6 +10,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
+# ANSI color codes
+class Colors:
+    RED = '\033[1;31m'
+    YELLOW = '\033[1;33m'
+    GREEN = '\033[1;32m'
+    RESET = '\033[0m'
+
+    @staticmethod
+    def colorize_status(status: str) -> str:
+        """Add color and symbol based on status."""
+        status_lower = status.lower()
+        if status_lower == "match":
+            return f"{Colors.GREEN}✓ {status}{Colors.RESET}"
+        elif status_lower == "minor":
+            return f"{Colors.YELLOW}⚠ {status}{Colors.RESET}"
+        elif status_lower == "major":
+            return f"{Colors.RED}! {status}{Colors.RESET}"
+        elif status_lower == "differ":
+            return f"{Colors.RED}! {status}{Colors.RESET}"
+        elif status_lower == "error":
+            return f"{Colors.RED}✗ {status}{Colors.RESET}"
+        else:
+            return status
+
 
 OUTPUT_DIR_RE = re.compile(r"^Output folder\s*:\s*(.+)$")
 ARTIFACT_RE = re.compile(r"^Artifacts written to:\s*(.+)$")
@@ -158,14 +182,29 @@ def extract_summary(output: str):
 
 
 def format_table(headers: Tuple[str, ...], rows: List[Tuple[str, ...]]) -> str:
+    """Format a table with proper column alignment, handling ANSI color codes."""
+    # ANSI color code pattern
+    ansi_pattern = re.compile(r'\033\[[0-9;]+m')
+
+    def strip_ansi(text: str) -> str:
+        """Remove ANSI color codes for length calculation."""
+        return ansi_pattern.sub('', text)
+
     all_rows = [headers] + rows
     widths = [0] * len(headers)
     for row in all_rows:
         for idx, cell in enumerate(row):
-            widths[idx] = max(widths[idx], len(cell))
+            # Calculate width without ANSI codes
+            widths[idx] = max(widths[idx], len(strip_ansi(cell)))
 
     def fmt(row):
-        return " | ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(row))
+        formatted_cells = []
+        for idx, cell in enumerate(row):
+            # Calculate padding needed (accounting for ANSI codes)
+            visible_len = len(strip_ansi(cell))
+            padding = widths[idx] - visible_len
+            formatted_cells.append(cell + ' ' * padding)
+        return " | ".join(formatted_cells)
 
     sep = "-+-".join("-" * w for w in widths)
     parts = [fmt(headers), sep]
@@ -209,14 +248,15 @@ def main():
         if code != 0:
             any_failures = True
             print(output, file=sys.stderr)
-            summary_rows.append((inp.name, "error", "error", "n/a", "n/a", "n/a", "n/a"))
+            error_cell = Colors.colorize_status("error")
+            summary_rows.append((inp.name, error_cell, error_cell, "n/a", "n/a", "n/a", "n/a"))
             continue
 
         summary = extract_summary(output)
-        report_cell = summary["report_status"]
+        report_cell = Colors.colorize_status(summary["report_status"])
         if summary["report_path"]:
             diff_rows.append((Path(summary["report_path"]).name, summary["report_path"]))
-        binary_cell = summary["binary_status"]
+        binary_cell = Colors.colorize_status(summary["binary_status"])
         summary_rows.append((inp.name, report_cell, binary_cell,
                            summary["total_links"], summary["sim_duration"],
                            summary["gpu_time"], summary["cpu_time"]))

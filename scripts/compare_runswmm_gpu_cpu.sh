@@ -163,7 +163,14 @@ with open(dst, 'w', encoding='utf-8') as f:
 PY
 fi
 
+# ANSI color codes
+RED='\033[1;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[1;32m'
+RESET='\033[0m'
+
 if [ ! -s "$FILTERED_REPORT_DIFF" ]; then
+    echo -e "${GREEN}✓${RESET} Reports match (after filtering metadata; diff stored at $FILTERED_REPORT_DIFF)."
     echo "Reports match (after filtering metadata; diff stored at $FILTERED_REPORT_DIFF)."
 else
     # Classify difference as minor or major based on number of diff lines
@@ -173,8 +180,10 @@ else
     # - Minor: 1-10 lines of diff (small numeric differences, rounding errors)
     # - Major: >10 lines of diff (significant structural or value differences)
     if [ "$DIFF_LINE_COUNT" -le 10 ]; then
+        echo -e "${YELLOW}⚠${RESET} Reports differ - MINOR differences ($DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
         echo "Reports differ - MINOR differences ($DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
     else
+        echo -e "${RED}!${RESET} Reports differ - MAJOR differences ($DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
         echo "Reports differ - MAJOR differences ($DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
     fi
 fi
@@ -182,8 +191,10 @@ fi
 echo
 echo "==> Comparing binary output files"
 if cmp -s "$CPU_OUT" "$GPU_OUT"; then
+    echo -e "${GREEN}✓${RESET} Binary outputs match."
     echo "Binary outputs match."
 else
+    echo -e "${RED}!${RESET} Binary outputs differ."
     echo "Binary outputs differ."
 fi
 
