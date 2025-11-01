@@ -157,6 +157,9 @@ with open(src, 'r', encoding='utf-8', errors='ignore') as f:
             continue
         if any(token in stripped for token in drop_substrings):
             continue
+        # Skip context lines (lines without +/- prefix) - these are identical in both files
+        if line and line[0] not in ('+', '-'):
+            continue
         filtered.append(line)
 with open(dst, 'w', encoding='utf-8') as f:
     f.writelines(filtered)
