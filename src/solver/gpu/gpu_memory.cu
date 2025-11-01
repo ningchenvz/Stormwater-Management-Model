@@ -1313,6 +1313,11 @@ int gpu_transferNodeIterationStateFromDevice(GPU_NodeData* data, int count)
     CUDA_CHECK(cudaMemcpy(data->h_sumdqdh, data->d_sumdqdh, doubleSize, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(data->h_converged, data->d_converged, charSize, cudaMemcpyDeviceToHost));
 
+    // CRITICAL: Also transfer newDepth and newVolume for CPU non-conduits
+    // Pumps need these values to compute flows correctly
+    CUDA_CHECK(cudaMemcpy(data->h_newDepth, data->d_newDepth, doubleSize, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(data->h_newVolume, data->d_newVolume, doubleSize, cudaMemcpyDeviceToHost));
+
     return 0;
 }
 

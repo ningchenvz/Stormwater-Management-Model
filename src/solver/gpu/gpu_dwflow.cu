@@ -352,6 +352,10 @@ static void copyNodesFromGpu(GPU_NodeData* gpuNodes)
         Node[i].outflow = gpuNodes->h_outflow[i];
         Xnode[i].newSurfArea = gpuNodes->h_newSurfArea[i];
         Xnode[i].sumdqdh     = gpuNodes->h_sumdqdh[i];
+
+        // CRITICAL: Also transfer newDepth and newVolume for CPU non-conduits (pumps need these!)
+        Node[i].newDepth = gpuNodes->h_newDepth[i];
+        Node[i].newVolume = gpuNodes->h_newVolume[i];
     }
 }
 
@@ -1543,7 +1547,10 @@ int gpu_computeConduitFlows(
         CUDA_CHECK_LAST_ERROR();
     }
 
-    // TEMPORARY: Disable pumps to test Session18
+    // Track whether non-conduits were processed on GPU
+    bool nonConduitsProcessedOnGPU = false;
+
+    // PUMP PROCESSING: Currently disabled for debugging
     // FULLY SEQUENTIAL PUMP PROCESSING (Exact CPU Logic)
     // Process each pump: compute flow → getModPumpFlow → update nodes → next pump
     // This matches CPU behavior EXACTLY where each pump sees previous pumps' effects
@@ -1553,6 +1560,15 @@ int gpu_computeConduitFlows(
             dt, routeModel,
             ucfVolume, ucfLength, ucfFlow);
         CUDA_CHECK_LAST_ERROR();
+        nonConduitsProcessedOnGPU = true;
+    }
+
+    // Similarly track if weirs/orifices/outlets are enabled
+    // Since they ARE currently enabled, mark as processed
+    if ((Nlinks[ORIFICE] > 0 && g_gpuOrifices.count > 0) ||
+        (Nlinks[WEIR] > 0 && g_gpuWeirs.count > 0) ||
+        (Nlinks[OUTLET] > 0 && g_gpuOutlets.count > 0)) {
+        nonConduitsProcessedOnGPU = true;
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1719,7 +1735,13 @@ int gpu_computeConduitFlows(
     }
     // --- END DEBUG
 
-    return 0;
+    // Return 0 if ALL link types processed on GPU
+    // Return 1 if only conduits processed (CPU needs to handle non-conduits)
+    if (nonConduitsProcessedOnGPU) {
+        return 0;  // Success - all link types handled by GPU
+    } else {
+        return 1;  // Partial success - only conduits processed, CPU should handle non-conduits
+    }
 }
 
 } // extern "C"
