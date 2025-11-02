@@ -1298,6 +1298,7 @@ int gpu_transferNodeDynamicToDevice(GPU_NodeData* data, int count)
     CUDA_CHECK(cudaMemcpy(data->d_inflow, data->h_inflow, doubleSize, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(data->d_outflow, data->h_outflow, doubleSize, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(data->d_overflow, data->h_overflow, doubleSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(data->d_newLatFlow, data->h_newLatFlow, doubleSize, cudaMemcpyHostToDevice));  // Lateral inflows change each timestep!
 
     // Transfer extended data
     CUDA_CHECK(cudaMemcpy(data->d_converged, data->h_converged, charSize, cudaMemcpyHostToDevice));

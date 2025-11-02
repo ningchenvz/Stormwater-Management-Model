@@ -143,8 +143,35 @@ __device__ double gpu_storage_getSurfArea(
 
     switch (storageShape) {
         case GPU_STORAGE_TABULAR:
+            // Debug: check for NULL pointers
+            if (storageCurve == 0 && depth > 0.1) {
+                static int null_check_done = 0;
+                if (!null_check_done) {
+                    printf("GPU_SURF_DEBUG curve=%d curves=%p points=%p\n",
+                           storageCurve, curves, points);
+                    null_check_done = 1;
+                }
+            }
+
             if (storageCurve >= 0 && curves != NULL && points != NULL) {
-                // Use table lookup for surface area (same as volume lookup)
+                // Debug: print curve info for curveIdx=0 and 10
+                bool debug_this = ((storageCurve == 0 || storageCurve == 10) && depth > 0.1);
+
+                if (debug_this) {
+                    int start = curves->d_dataStart[storageCurve];
+                    int count = curves->d_dataCount[storageCurve];
+                    printf("\nGPU_SURF_DEBUG curve=%d depth_internal=%.6f ucfLength=%.6f\n",
+                           storageCurve, depth, ucfLength);
+                    printf("  d_user = depth * ucfLength = %.6f * %.6f = %.6f\n",
+                           depth, ucfLength, d);
+                    printf("  Curve points (x=depth_user, y=area_user): ");
+                    for (int j = 0; j < count; j++) {
+                        printf("(%.3f,%.1f) ", points->d_xValues[start+j], points->d_yValues[start+j]);
+                    }
+                    printf("\n");
+                }
+
+                // Use table lookup for surface area
                 area = gpu_table_lookupEx(
                     storageCurve,
                     d,
@@ -152,6 +179,13 @@ __device__ double gpu_storage_getSurfArea(
                     curves->d_dataCount,
                     points->d_xValues,
                     points->d_yValues);
+
+                if (debug_this) {
+                    double area_internal = area / (ucfLength * ucfLength);
+                    printf("  area_user (from lookup) = %.2f\n", area);
+                    printf("  area_internal = area_user / (ucfLength²) = %.2f / %.6f = %.2f ft²\n",
+                           area, ucfLength * ucfLength, area_internal);
+                }
             }
             break;
 
@@ -342,9 +376,25 @@ __device__ void gpu_setNodeDepth(
     surfArea = newSurfArea;
     surfArea = gpu_MAX(surfArea, minSurfArea);
 
+    // DEBUG: Trace J1 (node 0) depth calculation (first 3 iterations only)
+    if (i == 0 && steps <= 3 && nodeType == GPU_JUNCTION) {
+        printf("J1_DEPTH[step=%d]: fullDepth=%.3f surDepth=%.3f pondedArea=%.3f\n",
+               steps, fullDepth, surDepth, pondedArea);
+        printf("  newSurfArea=%.3f minSurfArea=%.3f surfArea(used)=%.3f\n",
+               newSurfArea, minSurfArea, surfArea);
+        printf("  inflow=%.6f outflow=%.6f oldNetInflow=%.6f\n",
+               inflow, outflow, oldNetInflow);
+        printf("  yOld=%.6f yLast=%.6f dt=%.3f\n", yOld, yLast, dt);
+    }
+
     // --- determine average net flow volume into node over the time step
     dQ = inflow - outflow;
     dV = 0.5 * (oldNetInflow + dQ) * dt;
+
+    // DEBUG: Trace J1 flow calculation
+    if (i == 0 && steps <= 3 && nodeType == GPU_JUNCTION) {
+        printf("  dQ=%.6f dV=%.6f dy=%.6f\n", dQ, dV, dV/surfArea);
+    }
 
     // --- determine if node is EXTRAN surcharged
     isSurcharged = 0;

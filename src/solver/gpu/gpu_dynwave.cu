@@ -94,6 +94,13 @@ __global__ void kernel_resetNodeAccumulators(
 
     // Reset inflow/outflow (start with lateral flows and losses)
     double latFlow = nodes->d_newLatFlow[i];
+
+    // DEBUG: Print J1 (node 0) lateral flow in first 3 calls
+    if (i == 0 && debugPrint > 0 && debugPrint <= 3) {
+        printf("RESET_J1[iter=%d]: latFlow=%.6f losses=%.6f\n",
+               debugPrint, latFlow, nodes->d_losses[i]);
+    }
+
     if (latFlow >= 0.0) {
         nodes->d_inflow[i] = latFlow;
         nodes->d_outflow[i] = nodes->d_losses[i];
@@ -137,6 +144,58 @@ __global__ void kernel_resetNodeAccumulators(
 }
 
 //=============================================================================
+// Kernel: Set Outfall Depths
+//=============================================================================
+
+__global__ void kernel_setOutfallDepths(
+    GPU_NodeData* nodes,
+    GPU_LinkData* links)
+//
+//  Purpose: Sets water depth at outfall nodes based on connecting link flow
+//           Simplified version: uses link depth as proxy for outfall depth
+//           Mirrors CPU link_setOutfallDepth() in link.c (FREE_OUTFALL behavior)
+//  Input:   nodes = GPU node data structure
+//           links = GPU link data structure
+//
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= links->count) return;
+
+    // Find which end node of link is an outfall
+    int n = -1;
+    int upstreamNode = -1;
+
+    if (nodes->d_type[links->d_node2[j]] == GPU_OUTFALL) {
+        n = links->d_node2[j];
+        upstreamNode = links->d_node1[j];
+    } else if (nodes->d_type[links->d_node1[j]] == GPU_OUTFALL) {
+        n = links->d_node1[j];
+        upstreamNode = links->d_node2[j];
+    } else {
+        return;  // No outfall on this link
+    }
+
+    // Simplified approach: Set outfall depth to link depth
+    // This allows water to flow out without requiring complex normal/critical depth calculations
+    // For FREE_OUTFALL, use the link's flow depth as the outfall depth
+    double linkDepth = links->d_newDepth[j];
+
+    // If link has no depth but has flow, use a small depth to allow drainage
+    if (linkDepth < 0.001 && fabs(links->d_newFlow[j]) > 0.001) {
+        linkDepth = 0.001;
+    }
+
+    nodes->d_newDepth[n] = linkDepth;
+
+    // Debug: Print first few outfall updates
+    static __device__ int debug_count = 0;
+    if (atomicAdd(&debug_count, 1) < 10) {
+        printf("GPU: Setting outfall node %d to depth %.6f (link %d depth=%.6f flow=%.3f)\n",
+               n, linkDepth, j, links->d_newDepth[j], links->d_newFlow[j]);
+    }
+}
+
+//=============================================================================
 // Kernel: Find Node Depths
 //=============================================================================
 
@@ -172,6 +231,13 @@ __global__ void kernel_findNodeDepths(
     // DEBUG: Print dt value from first thread, first few iterations
     if (i == 0 && steps < 3) {
         printf("GPU kernel_findNodeDepths: dt = %.6f, steps = %d\n", dt, steps);
+    }
+
+    // DEBUG: Print J1 geometry (node index 0, first 5 calls)
+    if (i == 0 && steps <= 5) {
+        printf("J1_GEOM[step=%d]: fullDepth=%.6f fullVol=%.6f surDepth=%.6f invertElev=%.6f crownElev=%.6f minSurfArea=%.6f\n",
+               steps, nodes->d_fullDepth[0], nodes->d_fullVolume[0], nodes->d_surDepth[0],
+               nodes->d_invertElev[0], nodes->d_crownElev[0], minSurfArea);
     }
 
     if (i >= nodes->count) return;
@@ -274,6 +340,14 @@ int gpu_computeNodeDepths(
 
     double ucfLength = UCF(LENGTH);
     double ucfVolume = UCF(VOLUME);
+
+    // DEBUG: Print unit conversion factors once
+    static int ucf_printed = 0;
+    if (!ucf_printed) {
+        printf("DEBUG UCF (findNodeDepths): ucfLength=%.6f ucfVolume=%.6f\n", ucfLength, ucfVolume);
+        ucf_printed = 1;
+    }
+
     GPU_CurveData* d_curves = g_gpuDeviceCurves;
     GPU_CurvePoints* d_curvePoints = g_gpuDeviceCurvePoints;
 
@@ -377,6 +451,15 @@ static void copyNodesToGpu(GPU_NodeData* nodes)
             nodes->h_storageA0[i]    = Storage[sIdx].a0;
             nodes->h_storageA1[i]    = Storage[sIdx].a1;
             nodes->h_storageA2[i]    = Storage[sIdx].a2;
+
+            // DEBUG: Print storage node configuration
+            static int debug_printed = 0;
+            if (!debug_printed) {
+                printf("DEBUG: Storage node %d (ID=%s) sIdx=%d shape=%d curve=%d a0=%.3f a1=%.3f a2=%.3f\n",
+                       i, Node[i].ID, sIdx,
+                       nodes->h_storageShape[i], nodes->h_storageCurve[i],
+                       nodes->h_storageA0[i], nodes->h_storageA1[i], nodes->h_storageA2[i]);
+            }
         }
     }
 
@@ -396,9 +479,11 @@ static void copyNodesFromGpu(GPU_NodeData* nodes)
 
     for (int i = 0; i < count; i++)
     {
+        // Copy depth for all nodes (including outfalls, which are set by GPU outfall kernel)
+        double newDepth = nodes->h_newDepth[i];
+
         if (Node[i].type != OUTFALL)
         {
-            double newDepth = nodes->h_newDepth[i];
             double newVolume_GPU = nodes->h_newVolume[i];
             double newVolume = newVolume_GPU;
 
@@ -435,8 +520,8 @@ static void copyNodesFromGpu(GPU_NodeData* nodes)
                     double vol_diff = volume_GPU - volume_CPU;
                     double vol_pct = (volume_CPU > 0.001) ? (vol_diff / volume_CPU * 100.0) : 0.0;
 
-                    // Compare surface areas
-                    double surfArea_CPU = node_getSurfArea(i, newDepth);
+                    // Compare surface areas (must use Xnode[].newSurfArea which includes conduit contributions)
+                    double surfArea_CPU = Xnode[i].newSurfArea;  // With conduit contributions
                     double surfArea_GPU = nodes->h_newSurfArea[i];
                     double surf_diff = surfArea_GPU - surfArea_CPU;
                     double surf_pct = (surfArea_CPU > 0.001) ? (surf_diff / surfArea_CPU * 100.0) : 0.0;
@@ -453,10 +538,32 @@ static void copyNodesFromGpu(GPU_NodeData* nodes)
                 }
             }
 
-            Node[i].newDepth  = newDepth;
             Node[i].newVolume = newVolume;
             Node[i].overflow  = nodes->h_overflow[i];
         }
+
+        // Always copy depth (including for outfalls, which are set by GPU outfall kernel)
+        Node[i].newDepth = newDepth;
+
+        // Copy inflow/outflow for statistics tracking
+        Node[i].inflow = nodes->h_inflow[i];
+        Node[i].outflow = nodes->h_outflow[i];
+
+        // Update oldNetInflow for next timestep (mirrors node_setOldHydState at node.c:339)
+        Node[i].oldNetInflow = nodes->h_inflow[i] - nodes->h_outflow[i];
+        nodes->h_oldNetInflow[i] = Node[i].oldNetInflow;
+
+        // DEBUG: Print STOR1 and J1 flow/depth (first 10 calls)
+        if (call_count <= 10) {
+            const char* nodeName = Node[i].ID;
+            if (strcmp(nodeName, "STOR1") == 0 || strcmp(nodeName, "J1") == 0) {
+                printf("%s[call=%d]: type=%d inflow=%.3f outflow=%.3f latFlow=%.3f depth=%.6f vol=%.6f surfArea=%.3f\n",
+                       nodeName, call_count, Node[i].type,
+                       nodes->h_inflow[i], nodes->h_outflow[i], nodes->h_newLatFlow[i],
+                       nodes->h_newDepth[i], nodes->h_newVolume[i], nodes->h_newSurfArea[i]);
+            }
+        }
+
         if (i == 852 && nodes->h_newVolume[i] < 0.05) {
             printf("copyNodesFromGpu: node 852 newVolume=%.6f newDepth=%.6f overflow=%.6f\n",
                    nodes->h_newVolume[i], nodes->h_newDepth[i], nodes->h_overflow[i]);
@@ -467,6 +574,96 @@ static void copyNodesFromGpu(GPU_NodeData* nodes)
         Xnode[i].sumdqdh     = nodes->h_sumdqdh[i];
         Xnode[i].dYdT        = nodes->h_dYdT[i];
     }
+}
+
+//=============================================================================
+// Diagnostic: Compare CPU vs GPU Surface Areas
+//=============================================================================
+static void diagnosticSurfaceAreas(
+    GPU_NodeData* nodes,
+    GPU_LinkData* links,
+    int timestep,
+    int iteration)
+//
+//  Purpose: Logs CPU vs GPU surface area comparison for debugging
+//  Input:   nodes = GPU node data (after copyback from device)
+//           links = GPU link data (after copyback from device)
+//           timestep = current routing timestep
+//           iteration = current Picard iteration
+//
+{
+    extern TNode* Node;
+    extern TLink* Link;
+    extern TXnode* Xnode;
+
+    static int call_count = 0;
+    call_count++;
+
+    // Only log first few timesteps/iterations to avoid spam
+    if (call_count > 20) return;
+
+    printf("\n=== SURFACE AREA DIAGNOSTIC (Step=%d Iter=%d) ===\n", timestep, iteration);
+
+    // Node surface areas
+    printf("NODE SURFACE AREAS:\n");
+    printf("%-15s %-10s %12s %12s %12s %8s\n",
+           "Node", "Type", "CPU(ft²)", "GPU(ft²)", "Diff(ft²)", "Err(%)");
+    printf("%-15s %-10s %12s %12s %12s %8s\n",
+           "---------------", "----------", "------------", "------------", "------------", "--------");
+
+    for (int i = 0; i < nodes->count && i < 20; i++) {
+        double cpu_surf = Xnode[i].newSurfArea;
+        double gpu_surf = nodes->h_newSurfArea[i];
+        double diff = gpu_surf - cpu_surf;
+        double pct = (cpu_surf > 0.001) ? (diff / cpu_surf * 100.0) : 0.0;
+
+        // Only print if significant difference or storage node
+        if (fabs(pct) > 1.0 || Node[i].type == STORAGE) {
+            const char* typeStr =
+                (Node[i].type == JUNCTION) ? "JUNCTION" :
+                (Node[i].type == OUTFALL) ? "OUTFALL" :
+                (Node[i].type == STORAGE) ? "STORAGE" :
+                (Node[i].type == DIVIDER) ? "DIVIDER" : "UNKNOWN";
+
+            printf("%-15s %-10s %12.2f %12.2f %12.2f %8.2f\n",
+                   Node[i].ID, typeStr, cpu_surf, gpu_surf, diff, pct);
+        }
+    }
+
+    // Link surface areas
+    printf("\nLINK SURFACE AREAS:\n");
+    printf("%-15s %-10s %12s %12s %12s %12s %8s\n",
+           "Link", "Type", "CPU_A1(ft²)", "GPU_A1(ft²)", "CPU_A2(ft²)", "GPU_A2(ft²)", "Err(%)");
+    printf("%-15s %-10s %12s %12s %12s %12s %8s\n",
+           "---------------", "----------", "------------", "------------", "------------", "------------", "--------");
+
+    for (int j = 0; j < links->count && j < 20; j++) {
+        double cpu_a1 = Link[j].surfArea1;
+        double gpu_a1 = links->h_surfArea1[j];
+        double cpu_a2 = Link[j].surfArea2;
+        double gpu_a2 = links->h_surfArea2[j];
+
+        double diff1 = gpu_a1 - cpu_a1;
+        double diff2 = gpu_a2 - cpu_a2;
+        double pct1 = (cpu_a1 > 0.001) ? (diff1 / cpu_a1 * 100.0) : 0.0;
+        double pct2 = (cpu_a2 > 0.001) ? (diff2 / cpu_a2 * 100.0) : 0.0;
+        double max_pct = fmax(fabs(pct1), fabs(pct2));
+
+        // Only print if significant difference
+        if (max_pct > 1.0) {
+            const char* typeStr =
+                (Link[j].type == CONDUIT) ? "CONDUIT" :
+                (Link[j].type == PUMP) ? "PUMP" :
+                (Link[j].type == ORIFICE) ? "ORIFICE" :
+                (Link[j].type == WEIR) ? "WEIR" :
+                (Link[j].type == OUTLET) ? "OUTLET" : "UNKNOWN";
+
+            printf("%-15s %-10s %12.2f %12.2f %12.2f %12.2f %8.2f\n",
+                   Link[j].ID, typeStr, cpu_a1, gpu_a1, cpu_a2, gpu_a2, max_pct);
+        }
+    }
+
+    printf("===============================================\n\n");
 }
 
 extern "C" int gpu_runNodeDepthKernel(
@@ -883,6 +1080,14 @@ extern "C" int gpu_runPersistentPicardIteration(
             return -1;
         }
 
+        // === OUTFALL DEPTHS (set boundary conditions based on link flows) ===
+        // This mirrors CPU's link_setOutfallDepth() at dynwave.c:817
+        // Must be called AFTER link flows are computed but BEFORE node depths
+        gridSize = GRID_SIZE(links->count, blockSize);
+        kernel_setOutfallDepths<<<gridSize, blockSize, 0, stream>>>(
+            d_nodes, d_links);
+        CUDA_CHECK_LAST_ERROR();
+
         // === NODE DEPTHS (device-resident with convergence check) ===
         if (gpu_computeNodeDepthsWithConvergence(
                 nodes, dt, allowPonding, surchargeMethod,
@@ -912,6 +1117,25 @@ extern "C" int gpu_runPersistentPicardIteration(
     gpu_transferNodeIterationStateFromDevice(nodes, nodes->count);
     copyLinkIterStateFromGpu(links);
     copyNodesFromGpu(nodes);
+
+    // Optional: Surface area diagnostic (enable with SWMM_DEBUG_SURF_AREA=1)
+    static int diagnostic_enabled = -1;
+    if (diagnostic_enabled == -1) {
+        const char* debug_env = getenv("SWMM_DEBUG_SURF_AREA");
+        diagnostic_enabled = (debug_env && atoi(debug_env) == 1) ? 1 : 0;
+        if (diagnostic_enabled) {
+            printf("\n*** Surface area diagnostics ENABLED (SWMM_DEBUG_SURF_AREA=1) ***\n");
+        }
+    }
+
+    if (diagnostic_enabled) {
+        // Note: This diagnostic currently only works in hybrid mode where CPU
+        // also computes surface areas. In all-GPU mode, CPU values will be stale.
+        // TODO: Add CPU recomputation for true comparison
+        static int timestep_counter = 0;
+        timestep_counter++;
+        diagnosticSurfaceAreas(nodes, links, timestep_counter, iter + 1);
+    }
 
     // Mark conduit results as dirty so gpu_flushConduitResults() will process them
     // This is CRITICAL for variable timestep calculation which needs current link flows
