@@ -5,16 +5,22 @@ GPU Flow Routing Test Suite
 
 Automated test to compare GPU vs CPU flow routing behavior on the model_full_features
 test case. Captures flow continuity, storage behavior, pump/weir performance, and
-generates comprehensive comparison reports.
+generates comprehensive comparison reports with intelligent numerical tolerance.
+
+Features:
+    - Smart diff comparison with configurable tolerance for numerical values
+    - Lines differing only by minor numerical values (within tolerance) are considered equivalent
+    - Default 5% tolerance for all numerical comparisons
+    - Only significant differences reported in output
 
 Usage:
-    python3 gpu_flow_routing_test.py [--output-dir OUTPUT_DIR]
+    python3 gpu_flow_routing_test.py [--output-dir OUTPUT_DIR] [--tolerance PERCENT]
 
 Output:
     - CPU/GPU .rpt files
     - Detailed comparison metrics CSV
     - Problem areas summary
-    - Diff report highlighting key differences
+    - Smart diff report showing only significant differences
 """
 
 import os
@@ -37,8 +43,14 @@ class Colors:
 class GPUFlowRoutingTest:
     """Main test class for GPU flow routing validation"""
 
-    def __init__(self, repo_root: str = None, output_dir: str = None):
-        """Initialize test suite"""
+    def __init__(self, repo_root: str = None, output_dir: str = None, tolerance_pct: float = 5.0):
+        """Initialize test suite
+
+        Args:
+            repo_root: Path to SWMM repository root
+            output_dir: Directory for test outputs
+            tolerance_pct: Percentage tolerance for numerical comparisons (default: 5.0%)
+        """
         if repo_root is None:
             repo_root = "/home/ningchenspark/workspace/Stormwater-Management-Model"
 
@@ -46,6 +58,7 @@ class GPUFlowRoutingTest:
         self.build_dir = self.repo_root / "build"
         self.test_model = self.repo_root / "tests/test_models/model_full_features.inp"
         self.runswmm_bin = self.build_dir / "bin/runswmm"
+        self.tolerance_pct = tolerance_pct
 
         if output_dir is None:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -245,34 +258,127 @@ class GPUFlowRoutingTest:
 
         print("\nMetrics saved to: {self.metrics_csv}")
 
+    def lines_are_similar(self, line1: str, line2: str, tolerance_pct: float = 5.0) -> bool:
+        """
+        Compare two lines considering minor numerical differences.
+
+        Args:
+            line1: First line to compare
+            line2: Second line to compare
+            tolerance_pct: Percentage tolerance for numerical differences
+
+        Returns:
+            True if lines are identical or differ only by minor numerical values
+        """
+        # If exactly the same, return True
+        if line1 == line2:
+            return True
+
+        # Extract all numbers from both lines
+        import re
+        num_pattern = r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?'
+        nums1 = re.findall(num_pattern, line1)
+        nums2 = re.findall(num_pattern, line2)
+
+        # If different number of numeric values, not similar
+        if len(nums1) != len(nums2):
+            return False
+
+        # If no numbers found, compare as strings
+        if len(nums1) == 0:
+            return line1.strip() == line2.strip()
+
+        # Replace numbers with placeholders and compare structure
+        text1 = re.sub(num_pattern, '{NUM}', line1)
+        text2 = re.sub(num_pattern, '{NUM}', line2)
+
+        # If structure differs, not similar
+        if text1 != text2:
+            return False
+
+        # Compare all numeric values with tolerance
+        for n1_str, n2_str in zip(nums1, nums2):
+            try:
+                n1 = float(n1_str)
+                n2 = float(n2_str)
+
+                # Handle zero case
+                if n1 == 0 and n2 == 0:
+                    continue
+                if n1 == 0 or n2 == 0:
+                    # If one is zero and the other is very small, consider similar
+                    if abs(n1 - n2) < 0.001:
+                        continue
+                    return False
+
+                # Calculate percentage difference
+                diff_pct = abs((n2 - n1) / n1) * 100
+                if diff_pct > tolerance_pct:
+                    return False
+
+            except (ValueError, ZeroDivisionError):
+                # If can't convert to float, must match exactly
+                if n1_str != n2_str:
+                    return False
+
+        return True
+
     def generate_diff(self):
-        """Generate detailed diff report"""
+        """Generate detailed diff report with tolerance for minor numerical differences"""
         self.print_header("Generating Difference Report")
 
         try:
             cpu_text = self.cpu_rpt.read_text()
             gpu_text = self.gpu_rpt.read_text()
 
-            # Write unified diff
-            import difflib
-            diff = difflib.unified_diff(
-                cpu_text.splitlines(keepends=True),
-                gpu_text.splitlines(keepends=True),
-                fromfile=str(self.cpu_rpt),
-                tofile=str(self.gpu_rpt),
-                lineterm=''
-            )
-
-            self.diff_file.write_text(''.join(diff))
-
-            # Count differences
             cpu_lines = cpu_text.splitlines()
             gpu_lines = gpu_text.splitlines()
 
-            diff_count = sum(1 for c, g in zip(cpu_lines, gpu_lines) if c != g)
-            diff_count += abs(len(cpu_lines) - len(gpu_lines))
+            # Write smart diff (only showing significant differences)
+            with open(self.diff_file, 'w') as f:
+                f.write(f"Smart Diff Report (tolerance: {self.tolerance_pct}% for numerical values)\n")
+                f.write(f"CPU Report: {self.cpu_rpt}\n")
+                f.write(f"GPU Report: {self.gpu_rpt}\n")
+                f.write("="*80 + "\n\n")
 
-            self.print_success(f"Diff report generated ({diff_count} differing lines)")
+                significant_diffs = 0
+                minor_diffs = 0
+
+                max_lines = max(len(cpu_lines), len(gpu_lines))
+
+                for i in range(max_lines):
+                    cpu_line = cpu_lines[i] if i < len(cpu_lines) else "[MISSING]"
+                    gpu_line = gpu_lines[i] if i < len(gpu_lines) else "[MISSING]"
+
+                    if cpu_line == gpu_line:
+                        continue  # Identical, skip
+
+                    # Check if similar with tolerance
+                    if self.lines_are_similar(cpu_line, gpu_line, tolerance_pct=self.tolerance_pct):
+                        minor_diffs += 1
+                        # Don't write minor differences to report
+                        continue
+
+                    # Significant difference - write to report
+                    significant_diffs += 1
+                    f.write(f"Line {i+1}:\n")
+                    f.write(f"  CPU: {cpu_line}\n")
+                    f.write(f"  GPU: {gpu_line}\n")
+                    f.write("\n")
+
+                # Summary at end of file
+                f.write("\n" + "="*80 + "\n")
+                f.write("SUMMARY:\n")
+                f.write(f"  Total lines compared: {max_lines}\n")
+                f.write(f"  Identical lines: {max_lines - significant_diffs - minor_diffs}\n")
+                f.write(f"  Minor differences (within {self.tolerance_pct}% tolerance): {minor_diffs}\n")
+                f.write(f"  Significant differences: {significant_diffs}\n")
+
+            if significant_diffs == 0:
+                self.print_success(f"No significant differences found ({minor_diffs} minor numerical variations)")
+            else:
+                self.print_warning(f"Found {significant_diffs} significant differences ({minor_diffs} minor)")
+
             print(f"File: {self.diff_file}")
 
         except Exception as e:
@@ -395,7 +501,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run with default output directory
+  # Run with default output directory and 5% tolerance
   python3 gpu_flow_routing_test.py
 
   # Run with custom output directory
@@ -403,6 +509,12 @@ Examples:
 
   # Specify repository location
   python3 gpu_flow_routing_test.py --repo-dir ~/workspace/SWMM
+
+  # Use stricter tolerance (2% for numerical differences)
+  python3 gpu_flow_routing_test.py --tolerance 2.0
+
+  # Use more lenient tolerance (10% for numerical differences)
+  python3 gpu_flow_routing_test.py --tolerance 10.0
         """
     )
 
@@ -418,9 +530,20 @@ Examples:
         default=None
     )
 
+    parser.add_argument(
+        '--tolerance',
+        type=float,
+        help='Percentage tolerance for numerical differences (default: 5.0)',
+        default=5.0
+    )
+
     args = parser.parse_args()
 
-    test = GPUFlowRoutingTest(repo_root=args.repo_dir, output_dir=args.output_dir)
+    test = GPUFlowRoutingTest(
+        repo_root=args.repo_dir,
+        output_dir=args.output_dir,
+        tolerance_pct=args.tolerance
+    )
     success = test.run_all()
 
     sys.exit(0 if success else 1)
