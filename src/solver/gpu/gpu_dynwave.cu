@@ -415,7 +415,8 @@ extern "C" int gpu_runNodeDepthKernel(
 
     copyNodesFromGpu(nodes);
 
-    if (g_prevNodeNewDepth) {
+    // DISABLED: CPU storage recompute fallback - let GPU handle storage nodes
+    if (0 && g_prevNodeNewDepth) {
         for (int i = 0; i < nodes->count; i++) {
             if (Node[i].type == STORAGE) {
                 double prevDepth = g_prevNodeNewDepth ? g_prevNodeNewDepth[i] : Node[i].newDepth;

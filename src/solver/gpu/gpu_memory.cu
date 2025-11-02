@@ -95,6 +95,10 @@ int gpu_allocateNodeData(GPU_NodeData* data, int nodeCount)
     hostBytes += intSize;
     CUDA_CHECK(cudaMallocHost((void**)&data->h_storageCurve, intSize));
     hostBytes += intSize;
+    CUDA_CHECK(cudaMallocHost((void**)&data->h_newLatFlow, doubleSize));
+    hostBytes += doubleSize;
+    CUDA_CHECK(cudaMallocHost((void**)&data->h_losses, doubleSize));
+    hostBytes += doubleSize;
 
     // Dynamic state
     CUDA_CHECK(cudaMallocHost((void**)&data->h_oldDepth, doubleSize));
@@ -157,6 +161,10 @@ int gpu_allocateNodeData(GPU_NodeData* data, int nodeCount)
     deviceBytes += intSize;
     CUDA_CHECK(cudaMalloc((void**)&data->d_storageCurve, intSize));
     deviceBytes += intSize;
+    CUDA_CHECK(cudaMalloc((void**)&data->d_newLatFlow, doubleSize));
+    deviceBytes += doubleSize;
+    CUDA_CHECK(cudaMalloc((void**)&data->d_losses, doubleSize));
+    deviceBytes += doubleSize;
 
     // Dynamic state
     CUDA_CHECK(cudaMalloc((void**)&data->d_oldDepth, doubleSize));
@@ -220,6 +228,8 @@ void gpu_freeNodeData(GPU_NodeData* data)
     if (data->h_storageA2) cudaFreeHost(data->h_storageA2);
     if (data->h_storageShape) cudaFreeHost(data->h_storageShape);
     if (data->h_storageCurve) cudaFreeHost(data->h_storageCurve);
+    if (data->h_newLatFlow) cudaFreeHost(data->h_newLatFlow);
+    if (data->h_losses) cudaFreeHost(data->h_losses);
     if (data->h_oldDepth) cudaFreeHost(data->h_oldDepth);
     if (data->h_newDepth) cudaFreeHost(data->h_newDepth);
     if (data->h_oldVolume) cudaFreeHost(data->h_oldVolume);
@@ -249,6 +259,8 @@ void gpu_freeNodeData(GPU_NodeData* data)
     CUDA_FREE_SAFE(data->d_storageA2);
     CUDA_FREE_SAFE(data->d_storageShape);
     CUDA_FREE_SAFE(data->d_storageCurve);
+    CUDA_FREE_SAFE(data->d_newLatFlow);
+    CUDA_FREE_SAFE(data->d_losses);
     CUDA_FREE_SAFE(data->d_oldDepth);
     CUDA_FREE_SAFE(data->d_newDepth);
     CUDA_FREE_SAFE(data->d_oldVolume);
@@ -1251,6 +1263,8 @@ int gpu_transferNodeStaticToDevice(GPU_NodeData* data, int count)
     CUDA_CHECK(cudaMemcpy(data->d_storageA2, data->h_storageA2, doubleSize, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(data->d_storageShape, data->h_storageShape, intSize, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(data->d_storageCurve, data->h_storageCurve, intSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(data->d_newLatFlow, data->h_newLatFlow, doubleSize, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(data->d_losses, data->h_losses, doubleSize, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(data->d_degree, data->h_degree, intSize, cudaMemcpyHostToDevice));
 
     return 0;

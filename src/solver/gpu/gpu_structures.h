@@ -56,6 +56,8 @@ typedef struct {
     double* h_storageA2;        // storage parameter a2
     int*    h_storageShape;     // storage shape enum
     int*    h_storageCurve;     // storage area curve index
+    double* h_newLatFlow;       // Lateral inflow (cfs) - for initNodeStates
+    double* h_losses;           // Node losses (cfs) - for initNodeStates
 
     // Dynamic state (updated each iteration)
     double* h_oldDepth;         // Previous water depth (ft)
@@ -92,6 +94,8 @@ typedef struct {
     double* d_storageA2;
     int*    d_storageShape;
     int*    d_storageCurve;
+    double* d_newLatFlow;       // Lateral inflow (cfs) - for initNodeStates
+    double* d_losses;           // Node losses (cfs) - for initNodeStates
 
     // Dynamic state (updated each iteration)
     double* d_oldDepth;         // Previous water depth (ft)
