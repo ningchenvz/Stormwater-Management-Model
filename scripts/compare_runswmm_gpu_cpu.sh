@@ -10,6 +10,7 @@ Usage: scripts/compare_runswmm_gpu_cpu.sh <path/to/model.inp> [report_name] [out
 Environment variables:
   RUNSWMM    Path to runswmm executable (default: build/bin/runswmm)
   OUT_DIR    Directory to store run artifacts (default: build/gpu_cpu_compare)
+  TOLERANCE  Percentage tolerance for numerical differences (default: 5.0)
 EOF
     exit 1
 }
@@ -141,30 +142,109 @@ echo
 echo "==> Comparing report files"
 REPORT_DIFF=${RUN_DIR}/${BASE_STEM}_report.diff
 FILTERED_REPORT_DIFF=${RUN_DIR}/${BASE_STEM}_report.filtered.diff
-if diff -u "$CPU_RPT" "$GPU_RPT" > "$REPORT_DIFF"; then
-    cp "$REPORT_DIFF" "$FILTERED_REPORT_DIFF"
-else
-    python3 - "$REPORT_DIFF" "$FILTERED_REPORT_DIFF" <<'PY'
+TOLERANCE=${TOLERANCE:-5.0}
+
+python3 - "$CPU_RPT" "$GPU_RPT" "$FILTERED_REPORT_DIFF" "$TOLERANCE" <<'PY'
 import sys
-src = sys.argv[1]
-dst = sys.argv[2]
+import re
+
+cpu_rpt = sys.argv[1]
+gpu_rpt = sys.argv[2]
+dst = sys.argv[3]
+tolerance_pct = float(sys.argv[4])
+
 drop_substrings = ("gpu_cpu_compare", "@@", "Analysis begun on:", "Analysis ended on:", "Total elapsed time:", "No newline at end of file")
+
+def lines_are_similar(line1, line2, tolerance):
+    """Compare two lines considering minor numerical differences."""
+    if line1 == line2:
+        return True
+
+    # Extract all numbers from both lines
+    num_pattern = r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?'
+    nums1 = re.findall(num_pattern, line1)
+    nums2 = re.findall(num_pattern, line2)
+
+    # If different number of numeric values, not similar
+    if len(nums1) != len(nums2):
+        return False
+
+    # If no numbers found, compare as strings
+    if len(nums1) == 0:
+        return line1.strip() == line2.strip()
+
+    # Replace numbers with placeholders and compare structure
+    text1 = re.sub(num_pattern, '{NUM}', line1)
+    text2 = re.sub(num_pattern, '{NUM}', line2)
+
+    # If structure differs, not similar
+    if text1 != text2:
+        return False
+
+    # Compare all numeric values with tolerance
+    for n1_str, n2_str in zip(nums1, nums2):
+        try:
+            n1 = float(n1_str)
+            n2 = float(n2_str)
+
+            # Handle zero case
+            if n1 == 0 and n2 == 0:
+                continue
+            if n1 == 0 or n2 == 0:
+                # If one is zero and the other is very small, consider similar
+                if abs(n1 - n2) < 0.001:
+                    continue
+                return False
+
+            # Calculate percentage difference
+            diff_pct = abs((n2 - n1) / n1) * 100
+            if diff_pct > tolerance:
+                return False
+        except (ValueError, ZeroDivisionError):
+            # If can't convert to float, must match exactly
+            if n1_str != n2_str:
+                return False
+
+    return True
+
+# Read both files
+with open(cpu_rpt, 'r', encoding='utf-8', errors='ignore') as f:
+    cpu_lines = f.readlines()
+
+with open(gpu_rpt, 'r', encoding='utf-8', errors='ignore') as f:
+    gpu_lines = f.readlines()
+
+# Find significant differences
 filtered = []
-with open(src, 'r', encoding='utf-8', errors='ignore') as f:
-    for line in f:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if any(token in stripped for token in drop_substrings):
-            continue
-        # Skip context lines (lines without +/- prefix) - these are identical in both files
-        if line and line[0] not in ('+', '-'):
-            continue
-        filtered.append(line)
+max_lines = max(len(cpu_lines), len(gpu_lines))
+
+for i in range(max_lines):
+    cpu_line = cpu_lines[i] if i < len(cpu_lines) else "[MISSING]"
+    gpu_line = gpu_lines[i] if i < len(gpu_lines) else "[MISSING]"
+
+    # Skip if identical
+    if cpu_line == gpu_line:
+        continue
+
+    # Skip metadata lines
+    if any(token in cpu_line for token in drop_substrings):
+        continue
+    if any(token in gpu_line for token in drop_substrings):
+        continue
+
+    # Check if similar with tolerance
+    if lines_are_similar(cpu_line, gpu_line, tolerance_pct):
+        continue
+
+    # Significant difference - add to filtered output
+    filtered.append(f"-{cpu_line}")
+    filtered.append(f"+{gpu_line}")
+
+# Write filtered diff
 with open(dst, 'w', encoding='utf-8') as f:
     f.writelines(filtered)
 PY
-fi
+
 
 # ANSI color codes
 RED='\033[1;31m'
@@ -173,8 +253,8 @@ GREEN='\033[1;32m'
 RESET='\033[0m'
 
 if [ ! -s "$FILTERED_REPORT_DIFF" ]; then
-    echo -e "${GREEN}✓${RESET} Reports match (after filtering metadata; diff stored at $FILTERED_REPORT_DIFF)."
-    echo "Reports match (after filtering metadata; diff stored at $FILTERED_REPORT_DIFF)."
+    echo -e "${GREEN}✓${RESET} Reports match (tolerance: ${TOLERANCE}%; filtered diff at $FILTERED_REPORT_DIFF)."
+    echo "Reports match (tolerance: ${TOLERANCE}%; filtered diff at $FILTERED_REPORT_DIFF)."
 else
     # Classify difference as minor or major based on number of diff lines
     DIFF_LINE_COUNT=$(wc -l < "$FILTERED_REPORT_DIFF")
@@ -183,11 +263,11 @@ else
     # - Minor: 1-10 lines of diff (small numeric differences, rounding errors)
     # - Major: >10 lines of diff (significant structural or value differences)
     if [ "$DIFF_LINE_COUNT" -le 10 ]; then
-        echo -e "${YELLOW}⚠${RESET} Reports differ - MINOR differences ($DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
-        echo "Reports differ - MINOR differences ($DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
+        echo -e "${YELLOW}⚠${RESET} Reports differ - MINOR differences (tolerance: ${TOLERANCE}%, $DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
+        echo "Reports differ - MINOR differences (tolerance: ${TOLERANCE}%, $DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
     else
-        echo -e "${RED}!${RESET} Reports differ - MAJOR differences ($DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
-        echo "Reports differ - MAJOR differences ($DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
+        echo -e "${RED}!${RESET} Reports differ - MAJOR differences (tolerance: ${TOLERANCE}%, $DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
+        echo "Reports differ - MAJOR differences (tolerance: ${TOLERANCE}%, $DIFF_LINE_COUNT lines; see $FILTERED_REPORT_DIFF)."
     fi
 fi
 

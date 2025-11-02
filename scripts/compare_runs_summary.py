@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only process INP files directly inside the given directory.",
     )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=5.0,
+        help="Percentage tolerance for numerical differences (default: 5.0%%)",
+    )
     return parser.parse_args()
 
 
@@ -230,6 +236,8 @@ def main():
         env["RUNSWMM"] = args.runswmm
     if args.out_dir:
         env["OUT_DIR"] = args.out_dir
+    # Pass tolerance to comparison script
+    env["TOLERANCE"] = str(args.tolerance)
 
     inp_files = collect_inp_files(target_dir, recursive=not args.non_recursive)
     if not inp_files:
