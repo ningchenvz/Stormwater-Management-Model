@@ -23,6 +23,10 @@ extern "C" {
 #include "dynwave_data.h"
 }
 
+// Crown cutoff constants (same as in dynwave.c)
+static const double EXTRAN_CROWN_CUTOFF = 0.96;      // crown cutoff for EXTRAN
+static const double SLOT_CROWN_CUTOFF   = 0.985257;  // crown cutoff for SLOT
+
 extern "C" void setNodeDepth_hostWrapper(int i, double dt);
 
 extern GPU_CurveData* g_gpuDeviceCurves;
@@ -540,6 +544,99 @@ extern "C" int gpu_computeNodeDepthsWithConvergence(
 }
 
 //=============================================================================
+// Forward declarations for external GPU functions and data
+//=============================================================================
+
+// External GPU data structures (defined in gpu_manager.cu and gpu_dwflow.cu)
+extern GPU_CurveData* g_gpuDeviceCurves;
+extern GPU_CurvePoints* g_gpuDeviceCurvePoints;
+extern GPU_PumpData g_gpuPumps;
+extern GPU_OrificeData g_gpuOrifices;
+extern GPU_WeirData g_gpuWeirs;
+extern GPU_OutletData g_gpuOutlets;
+
+// External kernel context (from gpu_dwflow.cu)
+typedef struct {
+    GPU_LinkData links;
+    GPU_ConduitData conduits;
+    GPU_XsectData xsects;
+    GPU_NodeData nodes;
+    GPU_LinkData* d_links;
+    GPU_ConduitData* d_conduits;
+    GPU_XsectData* d_xsects;
+    GPU_NodeData* d_nodes;
+    int linkCapacity;
+    int conduitCapacity;
+    int xsectCapacity;
+    int nodeCapacity;
+    int nonConduitCount;
+    int initialized;
+    int xsectsInitialized;
+    int linkStaticsInitialized;
+    int conduitStaticsInitialized;
+    int nodeStaticsInitialized;
+    int resultsDirty;
+    int linkStaticsUploaded;
+    int conduitStaticsUploaded;
+    int xsectsUploaded;
+    int nodeStaticsUploaded;
+} ConduitKernelContext;
+
+extern ConduitKernelContext g_conduitKernelCtx;
+
+// External helper functions from gpu_dwflow.cu
+extern int ensureConduitKernelContext();
+extern int ensureNonConduitStructuresInitialized(
+    GPU_PumpData** out_d_gpuPumps,
+    GPU_OrificeData** out_d_gpuOrifices,
+    GPU_WeirData** out_d_gpuWeirs,
+    GPU_OutletData** out_d_gpuOutlets,
+    GPU_CurveData** out_d_gpuCurves,
+    GPU_CurvePoints** out_d_gpuCurvePoints);
+
+extern int launchLinkFlowKernels(
+    GPU_LinkData* d_links,
+    GPU_ConduitData* d_conduits,
+    GPU_XsectData* d_xsects,
+    GPU_NodeData* d_nodes,
+    GPU_PumpData* d_gpuPumps,
+    GPU_OrificeData* d_gpuOrifices,
+    GPU_WeirData* d_gpuWeirs,
+    GPU_OutletData* d_gpuOutlets,
+    GPU_CurveData* d_gpuCurves,
+    GPU_CurvePoints* d_gpuCurvePoints,
+    double dt,
+    int steps,
+    double omega,
+    int surchargeMethod,
+    double crownCutoff,
+    int inertDamping,
+    cudaStream_t stream);
+
+extern void copyNodesToGpu(GPU_NodeData* nodes);
+extern void copyLinksToGpu(GPU_LinkData* links);
+extern void copyConduitsToGpu(GPU_ConduitData* conduits);
+extern void copyXsectsToGpu(GPU_XsectData* xsects);
+extern void copyNodesFromGpu(GPU_NodeData* nodes);
+extern void copyLinkIterStateFromGpu(GPU_LinkData* links);
+
+extern int gpu_transferLinkIterationResultsFromDevice(GPU_LinkData* links, int count);
+extern int gpu_transferNodeIterationStateFromDevice(GPU_NodeData* nodes, int count);
+
+// External kernel wrappers
+extern "C" int gpu_computeConduitFlows(
+    GPU_LinkData* links,
+    GPU_ConduitData* conduits,
+    GPU_XsectData* xsects,
+    GPU_NodeData* nodes,
+    double dt,
+    int steps,
+    double omega,
+    int surchargeMethod,
+    double crownCutoff,
+    int inertDamping);
+
+//=============================================================================
 
 extern "C" int gpu_runPersistentPicardIteration(
     double dt,
@@ -569,29 +666,91 @@ extern "C" int gpu_runPersistentPicardIteration(
 //               CPU-GPU transfers from O(N*iterations) to O(1)
 //
 {
+    extern TLink* Link;
+    extern TNode* Node;
+    extern int Nobjects[];
+    extern int Nlinks[];
+    extern int RouteModel;
+    extern int InertDamping;
+    extern int SurchargeMethod;
+
+    // Ensure both node and conduit kernel contexts are initialized
     if (ensureNodeKernelContext() != 0) {
+        return -1;
+    }
+    if (ensureConduitKernelContext() != 0) {
+        return -1;
+    }
+
+    // Get GPU contexts
+    GPU_NodeData* nodes = &g_nodeKernelCtx.data;
+    GPU_LinkData* links = &g_conduitKernelCtx.links;
+    GPU_ConduitData* conduits = &g_conduitKernelCtx.conduits;
+    GPU_XsectData* xsects = &g_conduitKernelCtx.xsects;
+
+    // Get device pointers
+    GPU_LinkData* d_links = g_conduitKernelCtx.d_links;
+    GPU_ConduitData* d_conduits = g_conduitKernelCtx.d_conduits;
+    GPU_XsectData* d_xsects = g_conduitKernelCtx.d_xsects;
+    GPU_NodeData* d_nodes = g_conduitKernelCtx.d_nodes;
+
+    // Ensure non-conduit structures (pumps, orifices, weirs, outlets) are initialized
+    GPU_PumpData* d_gpuPumps = NULL;
+    GPU_OrificeData* d_gpuOrifices = NULL;
+    GPU_WeirData* d_gpuWeirs = NULL;
+    GPU_OutletData* d_gpuOutlets = NULL;
+    GPU_CurveData* d_gpuCurves = NULL;
+    GPU_CurvePoints* d_gpuCurvePoints = NULL;
+
+    if (ensureNonConduitStructuresInitialized(&d_gpuPumps, &d_gpuOrifices, &d_gpuWeirs,
+                                               &d_gpuOutlets, &d_gpuCurves, &d_gpuCurvePoints) != 0) {
         return -1;
     }
 
     cudaStream_t stream = gpu_getStream();
-    GPU_NodeData* nodes = &g_nodeKernelCtx.data;
+
+    // Copy static geometry once (if not already uploaded)
+    if (!g_conduitKernelCtx.xsectsInitialized) {
+        copyXsectsToGpu(xsects);
+        g_conduitKernelCtx.xsectsInitialized = 1;
+    }
+
+    // Initial transfer: Copy node, link, and conduit data to GPU ONCE
+    copyNodesToGpu(nodes);
+    copyLinksToGpu(links);
+    copyConduitsToGpu(conduits);
+
+    // Copy GPU data structures to device
+    CUDA_CHECK(cudaMemcpy(d_links, links, sizeof(GPU_LinkData), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_conduits, conduits, sizeof(GPU_ConduitData), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_xsects, xsects, sizeof(GPU_XsectData), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_nodes, nodes, sizeof(GPU_NodeData), cudaMemcpyHostToDevice));
 
     // Allocate device memory for convergence counter
     int* d_convergedCount;
     int h_convergedCount;
     CUDA_CHECK(cudaMalloc(&d_convergedCount, sizeof(int)));
 
-    // Initial transfer: Copy node data to GPU
-    copyNodesToGpu(nodes);
-
-    // Picard iteration loop - stays mostly on GPU
+    // Picard iteration loop - ALL ON DEVICE
     int iter;
     int converged = 0;
-
-    cudaEventRecord(g_nodeKernelStartEvent, stream);
+    double crownCutoff = (surchargeMethod == EXTRAN) ? EXTRAN_CROWN_CUTOFF : SLOT_CROWN_CUTOFF;
 
     for (iter = 0; iter < maxIterations; iter++) {
-        // Compute node depths with on-device convergence check
+        // === LINK FLOWS (device-resident kernel launches) ===
+        if (launchLinkFlowKernels(
+                d_links, d_conduits, d_xsects, d_nodes,
+                d_gpuPumps, d_gpuOrifices, d_gpuWeirs, d_gpuOutlets,
+                d_gpuCurves, d_gpuCurvePoints,
+                dt, iter + 1, omega,
+                surchargeMethod, crownCutoff, InertDamping,
+                stream) != 0)
+        {
+            cudaFree(d_convergedCount);
+            return -1;
+        }
+
+        // === NODE DEPTHS (device-resident with convergence check) ===
         if (gpu_computeNodeDepthsWithConvergence(
                 nodes, dt, allowPonding, surchargeMethod,
                 minSurfArea, iter + 1, omega, headTol,
@@ -601,7 +760,7 @@ extern "C" int gpu_runPersistentPicardIteration(
             return -1;
         }
 
-        // Transfer only convergence counter (4 bytes) back to CPU
+        // === CONVERGENCE CHECK (only 4 bytes transferred) ===
         CUDA_CHECK(cudaMemcpy(&h_convergedCount, d_convergedCount,
                               sizeof(int), cudaMemcpyDeviceToHost));
 
@@ -612,16 +771,18 @@ extern "C" int gpu_runPersistentPicardIteration(
         }
     }
 
-    cudaEventRecord(g_nodeKernelStopEvent, stream);
-    cudaEventSynchronize(g_nodeKernelStopEvent);
+    // Synchronize before transferring results
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    float elapsedMs = 0.0f;
-    cudaEventElapsedTime(&elapsedMs, g_nodeKernelStartEvent, g_nodeKernelStopEvent);
-    gpu_profiler_addKernelTime((double)elapsedMs);
-
-    gpu_transferNodeDynamicFromDevice(nodes, nodes->count);
-    // Final transfer: Copy results back to CPU
+    // Final transfer: Copy ALL results back to CPU ONCE
+    gpu_transferLinkIterationResultsFromDevice(links, links->count);
+    gpu_transferNodeIterationStateFromDevice(nodes, nodes->count);
+    copyLinkIterStateFromGpu(links);
     copyNodesFromGpu(nodes);
+
+    // Mark conduit results as dirty so gpu_flushConduitResults() will process them
+    // This is CRITICAL for variable timestep calculation which needs current link flows
+    g_conduitKernelCtx.resultsDirty = 1;
 
     // Cleanup
     cudaFree(d_convergedCount);

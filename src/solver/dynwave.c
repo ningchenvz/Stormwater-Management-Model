@@ -316,6 +316,33 @@ int dynwave_execute(double tStep)
     }
     routingStepDebugCount++;
 
+#ifdef BUILD_GPU
+    // Try GPU Picard iteration if CUDA is enabled
+    if (g_gpuConfig.useCuda) {
+        int iterations, gpuConverged;
+        int result = gpu_runPersistentPicardIteration(
+            tStep, AllowPonding, SurchargeMethod, MinSurfArea,
+            Omega, HeadTol, MaxTrials, &iterations, &gpuConverged);
+
+        if (result == 0) {
+            // GPU Picard succeeded
+            Steps = iterations;
+            converged = gpuConverged;
+            if (!converged) updateConvergenceStats();
+            if (logThisStep) {
+                printf("  GPU Picard completed: %d iterations, %s\n",
+                       iterations, converged ? "converged" : "max iterations reached");
+            }
+            goto gpu_path_complete;
+        }
+        // Fall through to CPU on GPU failure
+        if (logThisStep) {
+            printf("  GPU Picard failed, falling back to CPU\n");
+        }
+    }
+#endif
+
+    // CPU Picard loop (fallback or when GPU disabled)
     while ( Steps < MaxTrials )
     {
         // --- execute a routing step & check for nodal convergence

@@ -82,7 +82,7 @@ typedef struct {
     int nodeStaticsUploaded;
 } ConduitKernelContext;
 
-static ConduitKernelContext g_conduitKernelCtx = {0};
+ConduitKernelContext g_conduitKernelCtx = {0};
 static cudaEvent_t g_conduitKernelStartEvent = 0;
 static cudaEvent_t g_conduitKernelStopEvent = 0;
 static int g_conduitKernelEventsInitialized = 0;
@@ -104,7 +104,7 @@ extern "C" {
 // Helper Functions: Data Transfer
 //=============================================================================
 
-static void copyLinksToGpu(GPU_LinkData* gpuLinks)
+void copyLinksToGpu(GPU_LinkData* gpuLinks)
 {
     if (!g_conduitKernelCtx.linkStaticsInitialized)
     {
@@ -156,7 +156,7 @@ static void copyLinksToGpu(GPU_LinkData* gpuLinks)
     gpu_transferLinkDynamicToDevice(gpuLinks, gpuLinks->count);
 }
 
-static void copyConduitsToGpu(GPU_ConduitData* gpuConduits)
+void copyConduitsToGpu(GPU_ConduitData* gpuConduits)
 {
     int k = 0;
     int needStaticUpload = !g_conduitKernelCtx.conduitStaticsInitialized;
@@ -196,7 +196,7 @@ static void copyConduitsToGpu(GPU_ConduitData* gpuConduits)
     gpu_transferConduitDynamicToDevice(gpuConduits, gpuConduits->count);
 }
 
-static void copyXsectsToGpu(GPU_XsectData* gpuXsects)
+void copyXsectsToGpu(GPU_XsectData* gpuXsects)
 {
     int count = gpuXsects->count;
     for (int j = 0; j < count; j++)
@@ -266,7 +266,7 @@ static void copyLinksFromGpu(GPU_LinkData* gpuLinks)
     }
 }
 
-static void copyLinkIterStateFromGpu(GPU_LinkData* gpuLinks)
+void copyLinkIterStateFromGpu(GPU_LinkData* gpuLinks)
 {
     int count = gpuLinks->count;
     for (int j = 0; j < count; j++)
@@ -386,7 +386,7 @@ static void copyNodesFromGpu(GPU_NodeData* gpuNodes)
     }
 }
 
-static int ensureConduitKernelContext()
+int ensureConduitKernelContext()
 {
     extern TNode* Node;
     extern int Nobjects[];
@@ -1414,6 +1414,178 @@ __global__ void kernel_findOutletFlows(
 }
 
 //=============================================================================
+// Helper: Launch Link Flow Kernels (Device-Resident)
+//=============================================================================
+//
+// Purpose: Launches ALL link flow kernels (conduits, pumps, orifices, weirs, outlets)
+//          WITHOUT any CPU-GPU data transfers. This is used by gpu_runPersistentPicardIteration()
+//          to keep data device-resident during the entire Picard loop.
+//
+// Parameters:
+//   - d_links, d_conduits, d_xsects, d_nodes: Device pointers (already on GPU)
+//   - d_gpuPumps, d_gpuOrifices, d_gpuWeirs, d_gpuOutlets: Device pointers
+//   - d_gpuCurves, d_gpuCurvePoints: Device pointers for storage curves
+//   - dt: Time step
+//   - steps: Picard iteration number
+//   - omega: Under-relaxation factor
+//   - surchargeMethod, crownCutoff, inertDamping: Solver parameters
+//   - stream: CUDA stream for asynchronous execution
+//
+// Returns: 0 on success, -1 on error
+//
+int launchLinkFlowKernels(
+    GPU_LinkData* d_links,
+    GPU_ConduitData* d_conduits,
+    GPU_XsectData* d_xsects,
+    GPU_NodeData* d_nodes,
+    GPU_PumpData* d_gpuPumps,
+    GPU_OrificeData* d_gpuOrifices,
+    GPU_WeirData* d_gpuWeirs,
+    GPU_OutletData* d_gpuOutlets,
+    GPU_CurveData* d_gpuCurves,
+    GPU_CurvePoints* d_gpuCurvePoints,
+    double dt,
+    int steps,
+    double omega,
+    int surchargeMethod,
+    double crownCutoff,
+    int inertDamping,
+    cudaStream_t stream)
+{
+    extern int Nlinks[];
+    extern int RouteModel;
+
+    // Get unit conversion factors
+    double ucfVolume = UCF(VOLUME);
+    double ucfLength = UCF(LENGTH);
+    double ucfFlow = UCF(FLOW);
+    int routeModel = RouteModel;
+
+    // Determine launch configuration
+    int blockSize = DEFAULT_BLOCK_SIZE;
+    int gridSize = GRID_SIZE(g_conduitKernelCtx.links.count, blockSize);
+
+    // Launch conduit flow kernel
+    kernel_findConduitFlows<<<gridSize, blockSize, 0, stream>>>(
+        d_links, d_conduits, d_xsects, d_nodes,
+        dt, steps, omega,
+        surchargeMethod, crownCutoff, inertDamping);
+
+    CUDA_CHECK_LAST_ERROR();
+
+    // Launch orifice kernel if orifices exist
+    if (Nlinks[ORIFICE] > 0 && g_gpuOrifices.count > 0) {
+        int orificeGridSize = GRID_SIZE(g_gpuOrifices.count, blockSize);
+        kernel_findOrificeFlows<<<orificeGridSize, blockSize, 0, stream>>>(
+            d_links, d_gpuOrifices, d_xsects, d_nodes, omega, routeModel);
+        CUDA_CHECK_LAST_ERROR();
+    }
+
+    // Launch weir kernel if weirs exist
+    if (Nlinks[WEIR] > 0 && g_gpuWeirs.count > 0) {
+        int weirGridSize = GRID_SIZE(g_gpuWeirs.count, blockSize);
+        kernel_findWeirFlows<<<weirGridSize, blockSize, 0, stream>>>(
+            d_links, d_gpuWeirs, d_xsects, d_nodes, omega, routeModel);
+        CUDA_CHECK_LAST_ERROR();
+    }
+
+    // Launch outlet kernel if outlets exist
+    if (Nlinks[OUTLET] > 0 && g_gpuOutlets.count > 0) {
+        int outletGridSize = GRID_SIZE(g_gpuOutlets.count, blockSize);
+        kernel_findOutletFlows<<<outletGridSize, blockSize, 0, stream>>>(
+            d_links, d_gpuOutlets, d_nodes, d_gpuCurves, d_gpuCurvePoints,
+            ucfLength, ucfFlow, omega, routeModel);
+        CUDA_CHECK_LAST_ERROR();
+    }
+
+    // Launch pump kernel (SEQUENTIAL - matches CPU behavior)
+    if (Nlinks[PUMP] > 0 && g_gpuPumps.count > 0) {
+        kernel_processPumpsSequentially<<<1, 1, 0, stream>>>(
+            d_links, d_gpuPumps, d_nodes, d_gpuCurves, d_gpuCurvePoints,
+            dt, routeModel,
+            ucfVolume, ucfLength, ucfFlow);
+        CUDA_CHECK_LAST_ERROR();
+    }
+
+    return 0;
+}
+
+//=============================================================================
+// Helper: Ensure Non-Conduit Structures Initialized
+//=============================================================================
+//
+// Purpose: Ensures all GPU device structures for non-conduit links are allocated
+//          and initialized. This must be called before using launchLinkFlowKernels()
+//          in the persistent Picard iteration.
+//
+// Returns: Pointers to device structures via output parameters
+//
+int ensureNonConduitStructuresInitialized(
+    GPU_PumpData** out_d_gpuPumps,
+    GPU_OrificeData** out_d_gpuOrifices,
+    GPU_WeirData** out_d_gpuWeirs,
+    GPU_OutletData** out_d_gpuOutlets,
+    GPU_CurveData** out_d_gpuCurves,
+    GPU_CurvePoints** out_d_gpuCurvePoints)
+{
+    // Static device pointers (persisted across calls)
+    static GPU_PumpData* d_gpuPumps = NULL;
+    static GPU_OrificeData* d_gpuOrifices = NULL;
+    static GPU_WeirData* d_gpuWeirs = NULL;
+    static GPU_OutletData* d_gpuOutlets = NULL;
+    static GPU_CurveData* d_gpuCurves = NULL;
+    static GPU_CurvePoints* d_gpuCurvePoints = NULL;
+    static int nonConduitStructuresInitialized = 0;
+
+    // One-time allocation and transfer of data structures (device pointers)
+    if (!nonConduitStructuresInitialized) {
+        if (g_gpuPumps.count > 0) {
+            CUDA_CHECK(cudaMalloc(&d_gpuPumps, sizeof(GPU_PumpData)));
+            CUDA_CHECK(cudaMemcpy(d_gpuPumps, &g_gpuPumps, sizeof(GPU_PumpData), cudaMemcpyHostToDevice));
+        }
+        if (g_gpuOrifices.count > 0) {
+            CUDA_CHECK(cudaMalloc(&d_gpuOrifices, sizeof(GPU_OrificeData)));
+            CUDA_CHECK(cudaMemcpy(d_gpuOrifices, &g_gpuOrifices, sizeof(GPU_OrificeData), cudaMemcpyHostToDevice));
+        }
+        if (g_gpuWeirs.count > 0) {
+            CUDA_CHECK(cudaMalloc(&d_gpuWeirs, sizeof(GPU_WeirData)));
+            CUDA_CHECK(cudaMemcpy(d_gpuWeirs, &g_gpuWeirs, sizeof(GPU_WeirData), cudaMemcpyHostToDevice));
+        }
+        if (g_gpuOutlets.count > 0) {
+            CUDA_CHECK(cudaMalloc(&d_gpuOutlets, sizeof(GPU_OutletData)));
+            CUDA_CHECK(cudaMemcpy(d_gpuOutlets, &g_gpuOutlets, sizeof(GPU_OutletData), cudaMemcpyHostToDevice));
+        }
+        if (g_gpuCurves.count > 0) {
+            if (g_gpuDeviceCurves == NULL) {
+                CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurves, sizeof(GPU_CurveData)));
+            }
+            CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurves, &g_gpuCurves,
+                                  sizeof(GPU_CurveData), cudaMemcpyHostToDevice));
+
+            if (g_gpuDeviceCurvePoints == NULL) {
+                CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurvePoints, sizeof(GPU_CurvePoints)));
+            }
+            CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurvePoints, &g_gpuCurvePoints,
+                                  sizeof(GPU_CurvePoints), cudaMemcpyHostToDevice));
+
+            d_gpuCurves = g_gpuDeviceCurves;
+            d_gpuCurvePoints = g_gpuDeviceCurvePoints;
+        }
+        nonConduitStructuresInitialized = 1;
+    }
+
+    // Return device pointers
+    *out_d_gpuPumps = d_gpuPumps;
+    *out_d_gpuOrifices = d_gpuOrifices;
+    *out_d_gpuWeirs = d_gpuWeirs;
+    *out_d_gpuOutlets = d_gpuOutlets;
+    *out_d_gpuCurves = d_gpuCurves;
+    *out_d_gpuCurvePoints = d_gpuCurvePoints;
+
+    return 0;
+}
+
+//=============================================================================
 // Host Function: Launch Conduit Flows Kernel
 //=============================================================================
 
@@ -1499,64 +1671,17 @@ int gpu_computeConduitFlows(
         printedPumpCount = 1;
     }
 
-    // Allocate and copy device memory for non-conduit data structures (one-time only)
-    static GPU_PumpData* d_gpuPumps = NULL;
-    static GPU_OrificeData* d_gpuOrifices = NULL;
-    static GPU_WeirData* d_gpuWeirs = NULL;
-    static GPU_OutletData* d_gpuOutlets = NULL;
-    static GPU_CurveData* d_gpuCurves = NULL;
-    static GPU_CurvePoints* d_gpuCurvePoints = NULL;
-    static int nonConduitStructuresInitialized = 0;
+    // Get device pointers for non-conduit data structures (uses static helper)
+    GPU_PumpData* d_gpuPumps = NULL;
+    GPU_OrificeData* d_gpuOrifices = NULL;
+    GPU_WeirData* d_gpuWeirs = NULL;
+    GPU_OutletData* d_gpuOutlets = NULL;
+    GPU_CurveData* d_gpuCurves = NULL;
+    GPU_CurvePoints* d_gpuCurvePoints = NULL;
 
-    // Pump preliminary flow buffers (for two-pass processing)
-    static double* d_prelimPumpFlows = NULL;
-    static double* d_prelimPumpDqdh = NULL;
-    static char* d_prelimPumpFlowClass = NULL;
-    static int prelimPumpBuffersAllocated = 0;
-
-    // One-time allocation and transfer of data structures (device pointers)
-    if (!nonConduitStructuresInitialized) {
-        if (g_gpuPumps.count > 0) {
-            CUDA_CHECK(cudaMalloc(&d_gpuPumps, sizeof(GPU_PumpData)));
-            CUDA_CHECK(cudaMemcpy(d_gpuPumps, &g_gpuPumps, sizeof(GPU_PumpData), cudaMemcpyHostToDevice));
-
-            // Allocate preliminary pump flow buffers
-            if (!prelimPumpBuffersAllocated) {
-                CUDA_CHECK(cudaMalloc(&d_prelimPumpFlows, g_gpuPumps.count * sizeof(double)));
-                CUDA_CHECK(cudaMalloc(&d_prelimPumpDqdh, g_gpuPumps.count * sizeof(double)));
-                CUDA_CHECK(cudaMalloc(&d_prelimPumpFlowClass, g_gpuPumps.count * sizeof(char)));
-                prelimPumpBuffersAllocated = 1;
-            }
-        }
-        if (g_gpuOrifices.count > 0) {
-            CUDA_CHECK(cudaMalloc(&d_gpuOrifices, sizeof(GPU_OrificeData)));
-            CUDA_CHECK(cudaMemcpy(d_gpuOrifices, &g_gpuOrifices, sizeof(GPU_OrificeData), cudaMemcpyHostToDevice));
-        }
-        if (g_gpuWeirs.count > 0) {
-            CUDA_CHECK(cudaMalloc(&d_gpuWeirs, sizeof(GPU_WeirData)));
-            CUDA_CHECK(cudaMemcpy(d_gpuWeirs, &g_gpuWeirs, sizeof(GPU_WeirData), cudaMemcpyHostToDevice));
-        }
-        if (g_gpuOutlets.count > 0) {
-            CUDA_CHECK(cudaMalloc(&d_gpuOutlets, sizeof(GPU_OutletData)));
-            CUDA_CHECK(cudaMemcpy(d_gpuOutlets, &g_gpuOutlets, sizeof(GPU_OutletData), cudaMemcpyHostToDevice));
-        }
-        if (g_gpuCurves.count > 0) {
-            if (g_gpuDeviceCurves == NULL) {
-                CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurves, sizeof(GPU_CurveData)));
-            }
-            CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurves, &g_gpuCurves,
-                                  sizeof(GPU_CurveData), cudaMemcpyHostToDevice));
-
-            if (g_gpuDeviceCurvePoints == NULL) {
-                CUDA_CHECK(cudaMalloc((void**)&g_gpuDeviceCurvePoints, sizeof(GPU_CurvePoints)));
-            }
-            CUDA_CHECK(cudaMemcpy(g_gpuDeviceCurvePoints, &g_gpuCurvePoints,
-                                  sizeof(GPU_CurvePoints), cudaMemcpyHostToDevice));
-
-            d_gpuCurves = g_gpuDeviceCurves;
-            d_gpuCurvePoints = g_gpuDeviceCurvePoints;
-        }
-        nonConduitStructuresInitialized = 1;
+    if (ensureNonConduitStructuresInitialized(&d_gpuPumps, &d_gpuOrifices, &d_gpuWeirs,
+                                               &d_gpuOutlets, &d_gpuCurves, &d_gpuCurvePoints) != 0) {
+        return -1;
     }
 
     // Launch conduit flow kernel
