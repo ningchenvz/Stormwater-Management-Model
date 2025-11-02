@@ -69,6 +69,74 @@ static int ensureDeviceCurvePointers(void)
 }
 
 //=============================================================================
+// Kernel: Reset Node Accumulators
+//=============================================================================
+
+__global__ void kernel_resetNodeAccumulators(
+    GPU_NodeData* nodes,
+    int allowPonding,
+    int debugPrint,
+    double ucfLength,
+    GPU_CurveData* curves,
+    GPU_CurvePoints* curvePoints)
+//
+//  Purpose: Resets node accumulators before each Picard iteration
+//           Mirrors CPU initNodeStates() in dynwave.c
+//  Input:   nodes = GPU node data structure
+//           allowPonding = TRUE if ponding is allowed
+//           debugPrint = iteration number for debug (0 = no print)
+//           ucfLength = unit conversion factor for length
+//           curves, curvePoints = storage curve data
+//
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nodes->count) return;
+
+    // Reset inflow/outflow (start with lateral flows and losses)
+    double latFlow = nodes->d_newLatFlow[i];
+    if (latFlow >= 0.0) {
+        nodes->d_inflow[i] = latFlow;
+        nodes->d_outflow[i] = nodes->d_losses[i];
+    } else {
+        nodes->d_inflow[i] = 0.0;
+        nodes->d_outflow[i] = nodes->d_losses[i] - latFlow;
+    }
+
+    // Reset sumdqdh
+    nodes->d_sumdqdh[i] = 0.0;
+
+    // Reset surface area to base value (intrinsic node area before conduit contributions)
+    // Conduit contributions will be atomicAdd'ed on top of this base
+    double depth = nodes->d_newDepth[i];
+    double baseArea;
+
+    // For ponded nodes above full depth, use ponded area
+    if (allowPonding && depth > nodes->d_fullDepth[i]) {
+        baseArea = nodes->d_pondedArea[i];
+    }
+    // For storage nodes, compute intrinsic surface area from storage curve/shape
+    else if (nodes->d_type[i] == GPU_STORAGE) {
+        baseArea = gpu_node_getSurfArea(
+            nodes->d_type[i],
+            depth,
+            nodes->d_storageA0[i],
+            nodes->d_storageA1[i],
+            nodes->d_storageA2[i],
+            nodes->d_storageShape[i],
+            nodes->d_storageCurve[i],
+            ucfLength,
+            curves,
+            curvePoints);
+    }
+    // For other nodes (junctions, outfalls, dividers), base area is zero
+    else {
+        baseArea = 0.0;
+    }
+
+    nodes->d_newSurfArea[i] = baseArea;
+}
+
+//=============================================================================
 // Kernel: Find Node Depths
 //=============================================================================
 
@@ -293,6 +361,8 @@ static void copyNodesToGpu(GPU_NodeData* nodes)
         nodes->h_oldSurfArea[i] = Xnode[i].oldSurfArea;
         nodes->h_sumdqdh[i]     = Xnode[i].sumdqdh;
         nodes->h_dYdT[i]        = Xnode[i].dYdT;
+        nodes->h_newLatFlow[i]  = Node[i].newLatFlow;
+        nodes->h_losses[i]      = Node[i].losses;
 
         nodes->h_storageA0[i]    = 0.0;
         nodes->h_storageA1[i]    = 0.0;
@@ -321,16 +391,68 @@ static void copyNodesToGpu(GPU_NodeData* nodes)
 static void copyNodesFromGpu(GPU_NodeData* nodes)
 {
     int count = nodes->count;
+    static int call_count = 0;
+    call_count++;
+
     for (int i = 0; i < count; i++)
     {
         if (Node[i].type != OUTFALL)
         {
             double newDepth = nodes->h_newDepth[i];
-            double newVolume = nodes->h_newVolume[i];
-            if (Node[i].type == STORAGE) {
-                newVolume = node_getVolume(i, newDepth);
-                nodes->h_newVolume[i] = newVolume;
+            double newVolume_GPU = nodes->h_newVolume[i];
+            double newVolume = newVolume_GPU;
+
+            // DISABLED CPU fallback - use GPU volume directly
+            if (0 && Node[i].type == STORAGE) {
+                double newVolume_CPU = node_getVolume(i, newDepth);
+                newVolume = newVolume_CPU;
+                nodes->h_newVolume[i] = newVolume_CPU;
+
+                // Log STOR-10 and TUNNEL_STORAGE volume comparison
+                // Only log first 50 calls to avoid spam
+                if (call_count <= 50) {
+                    const char* nodeName = Node[i].ID;
+                    if (strcmp(nodeName, "STOR-10") == 0 ||
+                        strcmp(nodeName, "TUNNEL_STORAGE") == 0) {
+                        double diff = newVolume_CPU - newVolume_GPU;
+                        double pct_diff = (newVolume_GPU > 0.001) ?
+                            (diff / newVolume_GPU * 100.0) : 0.0;
+                        printf("STORAGE_VOL[%s call=%d]: depth=%.6f GPU_vol=%.6f CPU_vol=%.6f diff=%.6f (%.2f%%)\n",
+                               nodeName, call_count, newDepth, newVolume_GPU, newVolume_CPU,
+                               diff, pct_diff);
+                    }
+                }
             }
+
+            // Log GPU vs CPU storage comparison (first 50 calls)
+            if (Node[i].type == STORAGE && call_count <= 50) {
+                const char* nodeName = Node[i].ID;
+                if (strcmp(nodeName, "STOR-10") == 0 ||
+                    strcmp(nodeName, "TUNNEL_STORAGE") == 0) {
+                    // Compare GPU vs CPU volumes AT THE SAME DEPTH
+                    double volume_CPU = node_getVolume(i, newDepth);
+                    double volume_GPU = newVolume_GPU;
+                    double vol_diff = volume_GPU - volume_CPU;
+                    double vol_pct = (volume_CPU > 0.001) ? (vol_diff / volume_CPU * 100.0) : 0.0;
+
+                    // Compare surface areas
+                    double surfArea_CPU = node_getSurfArea(i, newDepth);
+                    double surfArea_GPU = nodes->h_newSurfArea[i];
+                    double surf_diff = surfArea_GPU - surfArea_CPU;
+                    double surf_pct = (surfArea_CPU > 0.001) ? (surf_diff / surfArea_CPU * 100.0) : 0.0;
+
+                    // Get flows
+                    double inflow_gpu = nodes->h_inflow[i];
+                    double outflow_gpu = nodes->h_outflow[i];
+
+                    printf("STOR[%s c=%d]: depth=%.6f | VOL: GPU=%.6f CPU=%.6f diff=%.6f (%.2f%%) | SURF: GPU=%.1f CPU=%.1f diff=%.1f (%.2f%%) | in=%.3f out=%.3f\n",
+                           nodeName, call_count, newDepth,
+                           volume_GPU, volume_CPU, vol_diff, vol_pct,
+                           surfArea_GPU, surfArea_CPU, surf_diff, surf_pct,
+                           inflow_gpu, outflow_gpu);
+                }
+            }
+
             Node[i].newDepth  = newDepth;
             Node[i].newVolume = newVolume;
             Node[i].overflow  = nodes->h_overflow[i];
@@ -738,6 +860,16 @@ extern "C" int gpu_runPersistentPicardIteration(
     double crownCutoff = (surchargeMethod == EXTRAN) ? EXTRAN_CROWN_CUTOFF : SLOT_CROWN_CUTOFF;
 
     for (iter = 0; iter < maxIterations; iter++) {
+        // === RESET ACCUMULATORS (before link flows) ===
+        // This mirrors CPU's initNodeStates() which zeros inflow/outflow/surfArea/sumdqdh
+        // before each Picard iteration
+        int blockSize = DEFAULT_BLOCK_SIZE;
+        int gridSize = GRID_SIZE(nodes->count, blockSize);
+        kernel_resetNodeAccumulators<<<gridSize, blockSize, 0, stream>>>(
+            d_nodes, allowPonding, iter + 1,
+            UCF(LENGTH), d_gpuCurves, d_gpuCurvePoints);
+        CUDA_CHECK_LAST_ERROR();
+
         // === LINK FLOWS (device-resident kernel launches) ===
         if (launchLinkFlowKernels(
                 d_links, d_conduits, d_xsects, d_nodes,

@@ -23,6 +23,12 @@
 
 #define GPU_PUMP_DEBUG_MAX 256
 
+// Node type constants (from gpu_dynwave_kernels.cuh)
+#define GPU_JUNCTION    0
+#define GPU_OUTFALL     1
+#define GPU_STORAGE     2
+#define GPU_DIVIDER     3
+
 typedef struct {
     double dt;
     double qCurve;

@@ -911,7 +911,7 @@ void setNodeDepth(int i, double dt)
     Node[i].overflow = 0.0;
     surfArea = Xnode[i].newSurfArea;
     surfArea = MAX(surfArea, MinSurfArea);
-    
+
     // --- determine average net flow volume into node over the time step
     dQ = Node[i].inflow - Node[i].outflow;
     dV = 0.5 * (Node[i].oldNetInflow + dQ) * dt;

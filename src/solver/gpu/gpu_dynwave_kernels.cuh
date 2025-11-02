@@ -121,6 +121,63 @@ __device__ double gpu_storage_getVolume(
 
 //=============================================================================
 
+__device__ double gpu_storage_getSurfArea(
+    double depth,
+    double storageA0,
+    double storageA1,
+    double storageA2,
+    int storageShape,
+    int storageCurve,
+    double ucfLength,
+    const GPU_CurveData* curves,
+    const GPU_CurvePoints* points)
+//
+//  Purpose: Computes storage node surface area from depth using shape parameters
+//           Mirrors CPU storage_getSurfArea() in node.c
+//
+{
+    if (depth <= 0.0) return 0.0;
+
+    double area = 0.0;
+    double d = depth * ucfLength;
+
+    switch (storageShape) {
+        case GPU_STORAGE_TABULAR:
+            if (storageCurve >= 0 && curves != NULL && points != NULL) {
+                // Use table lookup for surface area (same as volume lookup)
+                area = gpu_table_lookupEx(
+                    storageCurve,
+                    d,
+                    curves->d_dataStart,
+                    curves->d_dataCount,
+                    points->d_xValues,
+                    points->d_yValues);
+            }
+            break;
+
+        case GPU_STORAGE_FUNCTIONAL:
+            // area = a0 + a1 * d^a2
+            area = storageA0 + storageA1 * pow(d, storageA2);
+            break;
+
+        case GPU_STORAGE_CYLINDRICAL:
+        case GPU_STORAGE_CONICAL:
+        case GPU_STORAGE_PARABOLOID:
+        case GPU_STORAGE_PYRAMIDAL:
+            // area = a0 + a1*d + a2*d^2
+            area = storageA0 + d * (storageA1 + d * storageA2);
+            break;
+
+        default:
+            return 0.0;
+    }
+
+    // Convert from user units to internal units (ft^2)
+    return area / (ucfLength * ucfLength);
+}
+
+//=============================================================================
+
 __device__ double gpu_node_getVolume(
     int nodeType,
     double depth,
@@ -150,6 +207,34 @@ __device__ double gpu_node_getVolume(
     if (fullDepth > 0.0)
         return fullVolume * (depth / fullDepth);
 
+    return 0.0;
+}
+
+//=============================================================================
+
+__device__ double gpu_node_getSurfArea(
+    int nodeType,
+    double depth,
+    double storageA0,
+    double storageA1,
+    double storageA2,
+    int storageShape,
+    int storageCurve,
+    double ucfLength,
+    const GPU_CurveData* curves,
+    const GPU_CurvePoints* points)
+//
+//  Purpose: Computes surface area at a node from its water depth
+//           Mirrors CPU node_getSurfArea() in node.c
+//
+{
+    if (nodeType == GPU_STORAGE) {
+        return gpu_storage_getSurfArea(depth, storageA0, storageA1, storageA2,
+                                        storageShape, storageCurve,
+                                        ucfLength, curves, points);
+    }
+
+    // All other node types (junctions, outfalls, dividers) return 0.0
     return 0.0;
 }
 
