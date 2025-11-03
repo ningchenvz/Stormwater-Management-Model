@@ -716,6 +716,7 @@ __global__ void kernel_findPumpFlows(
     GPU_LinkData* links,
     GPU_PumpData* pumps,
     GPU_NodeData* nodes,
+    GPU_LinkContribution* contributions,
     GPU_CurveData* curves,
     GPU_CurvePoints* points,
     double ucfVolume,          // unit conversion factors
@@ -828,15 +829,32 @@ __global__ void kernel_findPumpFlows(
     links->d_dqdh[j] = dqdh;
     links->d_flowClass[j] = flowClass;
 
-    // Update node flows
+    // STAGE 1: Write contributions to link-specific slot (deterministic)
+    GPU_LinkContribution* contrib = &contributions[j];
+
+    // Pumps always flow from n1 to n2 when qIn > 0
     if (qIn > 0.0) {
-        atomicAdd(&nodes->d_outflow[n1], qIn);
-        atomicAdd(&nodes->d_inflow[n2], qIn);
+        contrib->node1_outflow = qIn;
+        contrib->node1_inflow = 0.0;
+        contrib->node2_inflow = qIn;
+        contrib->node2_outflow = 0.0;
+    } else {
+        contrib->node1_outflow = 0.0;
+        contrib->node1_inflow = 0.0;
+        contrib->node2_inflow = 0.0;
+        contrib->node2_outflow = 0.0;
     }
 
+    // Pumps don't contribute surface area
+    contrib->node1_surfArea = 0.0;
+    contrib->node2_surfArea = 0.0;
+
     // Add dqdh to downstream node for TYPE3/TYPE5 pumps
+    contrib->node1_sumdqdh = 0.0;
     if (pumpType == 2 || pumpType == 4) {
-        atomicAdd(&nodes->d_sumdqdh[n2], dqdh);
+        contrib->node2_sumdqdh = dqdh;
+    } else {
+        contrib->node2_sumdqdh = 0.0;
     }
 }
 
@@ -1223,6 +1241,7 @@ __global__ void kernel_findOrificeFlows(
     GPU_OrificeData* orifices,
     GPU_XsectData* xsects,
     GPU_NodeData* nodes,
+    GPU_LinkContribution* contributions,
     double omega,
     int routeModel)  // 0=DW, 1=KW
 //
@@ -1346,22 +1365,28 @@ __global__ void kernel_findOrificeFlows(
     links->d_surfArea1[j] = surfArea1;
     links->d_surfArea2[j] = surfArea2;
 
-    // Accumulate surface areas to nodes
-    atomicAdd(&nodes->d_newSurfArea[n1], surfArea1);
-    atomicAdd(&nodes->d_newSurfArea[n2], surfArea2);
+    // STAGE 1: Write contributions to link-specific slot (deterministic)
+    GPU_LinkContribution* contrib = &contributions[j];
 
-    // Update node flows
+    contrib->node1_surfArea = surfArea1;
+    contrib->node2_surfArea = surfArea2;
+
+    // Orifices can flow in either direction
     if (qNew >= 0.0) {
-        atomicAdd(&nodes->d_outflow[n1], qNew);
-        atomicAdd(&nodes->d_inflow[n2], qNew);
+        contrib->node1_outflow = qNew;
+        contrib->node1_inflow = 0.0;
+        contrib->node2_inflow = qNew;
+        contrib->node2_outflow = 0.0;
     } else {
-        atomicAdd(&nodes->d_inflow[n1], -qNew);
-        atomicAdd(&nodes->d_outflow[n2], -qNew);
+        contrib->node1_inflow = -qNew;
+        contrib->node1_outflow = 0.0;
+        contrib->node2_outflow = -qNew;
+        contrib->node2_inflow = 0.0;
     }
 
-    // Add dqdh to nodes
-    atomicAdd(&nodes->d_sumdqdh[n1], dqdh);
-    atomicAdd(&nodes->d_sumdqdh[n2], dqdh);
+    // dqdh contributions to both nodes
+    contrib->node1_sumdqdh = dqdh;
+    contrib->node2_sumdqdh = dqdh;
 }
 
 //=============================================================================
@@ -1373,6 +1398,7 @@ __global__ void kernel_findWeirFlows(
     GPU_WeirData* weirs,
     GPU_XsectData* xsects,
     GPU_NodeData* nodes,
+    GPU_LinkContribution* contributions,
     double omega,
     int routeModel)
 //
@@ -1494,22 +1520,28 @@ __global__ void kernel_findWeirFlows(
     links->d_surfArea1[j] = surfArea1;
     links->d_surfArea2[j] = surfArea2;
 
-    // Accumulate surface areas to nodes
-    atomicAdd(&nodes->d_newSurfArea[n1], surfArea1);
-    atomicAdd(&nodes->d_newSurfArea[n2], surfArea2);
+    // STAGE 1: Write contributions to link-specific slot (deterministic)
+    GPU_LinkContribution* contrib = &contributions[j];
 
-    // Update node flows
+    contrib->node1_surfArea = surfArea1;
+    contrib->node2_surfArea = surfArea2;
+
+    // Weirs can flow in either direction
     if (qNew >= 0.0) {
-        atomicAdd(&nodes->d_outflow[n1], qNew);
-        atomicAdd(&nodes->d_inflow[n2], qNew);
+        contrib->node1_outflow = qNew;
+        contrib->node1_inflow = 0.0;
+        contrib->node2_inflow = qNew;
+        contrib->node2_outflow = 0.0;
     } else {
-        atomicAdd(&nodes->d_inflow[n1], -qNew);
-        atomicAdd(&nodes->d_outflow[n2], -qNew);
+        contrib->node1_inflow = -qNew;
+        contrib->node1_outflow = 0.0;
+        contrib->node2_outflow = -qNew;
+        contrib->node2_inflow = 0.0;
     }
 
-    // Add dqdh to nodes
-    atomicAdd(&nodes->d_sumdqdh[n1], dqdh);
-    atomicAdd(&nodes->d_sumdqdh[n2], dqdh);
+    // dqdh contributions to both nodes
+    contrib->node1_sumdqdh = dqdh;
+    contrib->node2_sumdqdh = dqdh;
 }
 
 //=============================================================================
@@ -1709,7 +1741,7 @@ int launchLinkFlowKernels(
     if (Nlinks[ORIFICE] > 0 && g_gpuOrifices.count > 0) {
         int orificeGridSize = GRID_SIZE(g_gpuOrifices.count, blockSize);
         kernel_findOrificeFlows<<<orificeGridSize, blockSize, 0, stream>>>(
-            d_links, d_gpuOrifices, d_xsects, d_nodes, omega, routeModel);
+            d_links, d_gpuOrifices, d_xsects, d_nodes, d_contributions, omega, routeModel);
         CUDA_CHECK_LAST_ERROR();
     }
 
@@ -1717,7 +1749,7 @@ int launchLinkFlowKernels(
     if (Nlinks[WEIR] > 0 && g_gpuWeirs.count > 0) {
         int weirGridSize = GRID_SIZE(g_gpuWeirs.count, blockSize);
         kernel_findWeirFlows<<<weirGridSize, blockSize, 0, stream>>>(
-            d_links, d_gpuWeirs, d_xsects, d_nodes, omega, routeModel);
+            d_links, d_gpuWeirs, d_xsects, d_nodes, d_contributions, omega, routeModel);
         CUDA_CHECK_LAST_ERROR();
     }
 
@@ -1932,7 +1964,7 @@ int gpu_computeConduitFlows(
     if (Nlinks[ORIFICE] > 0 && g_gpuOrifices.count > 0) {
         int orificeGridSize = GRID_SIZE(g_gpuOrifices.count, blockSize);
         kernel_findOrificeFlows<<<orificeGridSize, blockSize, 0, stream>>>(
-            d_links, d_gpuOrifices, d_xsects, d_nodes, omega, routeModel);
+            d_links, d_gpuOrifices, d_xsects, d_nodes, d_contributions, omega, routeModel);
         CUDA_CHECK_LAST_ERROR();
     }
 
@@ -1940,7 +1972,7 @@ int gpu_computeConduitFlows(
     if (Nlinks[WEIR] > 0 && g_gpuWeirs.count > 0) {
         int weirGridSize = GRID_SIZE(g_gpuWeirs.count, blockSize);
         kernel_findWeirFlows<<<weirGridSize, blockSize, 0, stream>>>(
-            d_links, d_gpuWeirs, d_xsects, d_nodes, omega, routeModel);
+            d_links, d_gpuWeirs, d_xsects, d_nodes, d_contributions, omega, routeModel);
         CUDA_CHECK_LAST_ERROR();
     }
 
