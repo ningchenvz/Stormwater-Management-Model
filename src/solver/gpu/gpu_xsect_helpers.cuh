@@ -46,6 +46,13 @@
 #define GPU_FORCE_MAIN      24
 #define GPU_STREET_XSECT    25
 
+//-----------------------------------------------------------------------------
+// Lookup Tables (from xsect.dat) - Auto-generated
+// All 41 tables for circular, egg, horseshoe, gothic, catenary, semi-elliptical,
+// baskethandle, semicircular, horizontal/vertical ellipse, and arch shapes
+//-----------------------------------------------------------------------------
+#include "gpu_lookup_tables.cuh"
+
 // Surcharge method
 #define GPU_SLOT_METHOD     1
 
@@ -140,58 +147,140 @@ __device__ double gpu_getSlotWidth(
 
 //=============================================================================
 
+__device__ double gpu_lookup(double x, const double* table, int nItems)
+//
+//  Purpose: Lookup with quadratic interpolation for low x (matches CPU xsect.c::lookup)
+//
+{
+    if (x <= 0.0) return table[0];
+    if (x >= 1.0) return table[nItems-1];
+
+    // Find which segment contains x
+    double delta = 1.0 / (double)(nItems - 1);
+    int i = (int)(x / delta);
+    if (i >= nItems - 1) return table[nItems-1];
+
+    // Compute x at start and end of segment
+    double x0 = i * delta;
+    double x1 = (i + 1) * delta;
+
+    // Linearly interpolate
+    double y = table[i] + (x - x0) * (table[i+1] - table[i]) / delta;
+
+    // Use quadratic interpolation for low x value (i < 2)
+    if (i < 2) {
+        double y2 = y + (x - x0) * (x - x1) / (delta * delta) *
+                   (table[i]/2.0 - table[i+1] + table[i+2]/2.0);
+        if (y2 > 0.0) y = y2;
+    }
+
+    return y;
+}
+
+__device__ int gpu_locate(double y, const double* table, int jLast)
+//
+//  Purpose: Uses bisection to find highest table index where table[j] <= y
+//
+{
+    int jLo = 0;
+    int jHi = jLast;
+
+    while (jHi - jLo > 1) {
+        int j = (jHi + jLo) / 2;
+        if (table[j] > y) jHi = j;
+        else jLo = j;
+    }
+    return jLo;
+}
+
+__device__ double gpu_invLookup(double y, const double* table, int nItems)
+//
+//  Purpose: Inverse lookup - finds x given y (matches CPU xsect.c::invLookup)
+//
+{
+    double dx = 1.0 / (double)(nItems - 1);
+    int n = nItems;
+
+    // Truncate if last 2 entries are decreasing
+    if (table[n-3] > table[n-1]) n = n - 2;
+
+    // Check if y falls in decreasing portion
+    int i;
+    if (n < nItems && y > table[nItems-1]) {
+        if (y >= table[nItems-3]) return ((double)n-1) * dx;
+        if (y <= table[nItems-2]) i = nItems - 2;
+        else i = nItems - 3;
+    }
+    else {
+        i = gpu_locate(y, table, n-1);
+        if (i >= n - 1) return ((double)n-1) * dx;
+    }
+
+    double x0 = i * dx;
+    double dy = table[i+1] - table[i];
+    double x;
+
+    if (dy == 0.0) x = x0;
+    else x = x0 + (y - table[i]) * dx / dy;
+
+    if (x < 0.0) x = 0.0;
+    if (x > 1.0) x = 1.0;
+    return x;
+}
+
 __device__ double gpu_circular_getWofY(double y, double d)
 //
-//  Purpose: Computes top width for circular section
+//  Purpose: Computes top width for circular section using lookup table
 //
 {
     if (y <= 0.0) return 0.0;
     if (y >= d) return d;
 
-    double theta = 2.0 * acos(1.0 - 2.0 * y / d);
-    return d * sin(theta / 2.0);
+    // Use lookup table like CPU does (matches xsect.c::xsect_getWofY)
+    double yNorm = y / d;
+    double wRatio = gpu_lookup(yNorm, W_CIRC, N_W_CIRC);
+    return d * wRatio;  // wMax = d for circular pipe
 }
 
 //=============================================================================
 
 __device__ double gpu_circular_getAofY(double y, double d)
 //
-//  Purpose: Computes area for circular cross-section
+//  Purpose: Computes area for circular section using lookup table
 //  Input:   y = flow depth (ft)
 //           d = diameter (ft)
 //  Returns: Flow area (ft2)
 //
 {
-    double theta;
-
     if (y <= 0.0) return 0.0;
-    if (y >= d) return GPU_PI * d * d / 4.0;
 
-    // Use circular segment formula
-    theta = 2.0 * acos(1.0 - 2.0 * y / d);
-    return d * d * (theta - sin(theta)) / 8.0;
+    double aFull = GPU_PI * d * d / 4.0;
+    if (y >= d) return aFull;
+
+    // Use lookup table like CPU does (matches xsect.c::xsect_getAofY)
+    double yNorm = y / d;
+    double aRatio = gpu_lookup(yNorm, A_CIRC, N_A_CIRC);
+    return aFull * aRatio;
 }
 
 //=============================================================================
 
 __device__ double gpu_circular_getRofY(double y, double d)
 //
-//  Purpose: Computes hydraulic radius for circular cross-section
+//  Purpose: Computes hydraulic radius for circular section using lookup table
 //  Input:   y = flow depth (ft)
 //           d = diameter (ft)
 //  Returns: Hydraulic radius (ft)
 //
 {
-    double a, w, theta;
-
     if (y <= 0.0) return 0.0;
     if (y >= d) return d / 4.0;
 
-    theta = 2.0 * acos(1.0 - 2.0 * y / d);
-    a = d * d * (theta - sin(theta)) / 8.0;
-    w = d * sin(theta / 2.0);
-
-    return (w > 0.0) ? a / w : 0.0;
+    // Use lookup table like CPU does (matches xsect.c::xsect_getRofY)
+    double yNorm = y / d;
+    double rFull = d / 4.0;
+    double rRatio = gpu_lookup(yNorm, R_CIRC, N_R_CIRC);
+    return rFull * rRatio;
 }
 
 //=============================================================================
@@ -294,14 +383,16 @@ __device__ double gpu_trapezoidal_getRofY(double y, double b, double s)
 
 __device__ double gpu_xsect_getWofY(GPU_Xsect* xsect, double y)
 //
-//  Purpose: Computes top width for supported shapes
+//  Purpose: Computes top width for all shapes using lookup tables where available
 //
 {
     if (y <= 0.0) return 0.0;
+    double yNorm = y / xsect->yFull;
 
     switch (xsect->type) {
         case GPU_CIRCULAR:
         case GPU_FILLED_CIRCULAR:
+        case GPU_FORCE_MAIN:
             return gpu_circular_getWofY(y, xsect->geom1);
 
         case GPU_RECT_CLOSED:
@@ -314,9 +405,39 @@ __device__ double gpu_xsect_getWofY(GPU_Xsect* xsect, double y)
         case GPU_TRIANGULAR:
             return gpu_trapezoidal_getWofY(y, 0.0, xsect->geom1);
 
+        case GPU_EGGSHAPED:
+            return xsect->wMax * gpu_lookup(yNorm, W_EGG, N_W_EGG);
+
+        case GPU_HORSESHOE:
+            return xsect->wMax * gpu_lookup(yNorm, W_HORSESHOE, N_W_HORSESHOE);
+
+        case GPU_GOTHIC:
+            return xsect->wMax * gpu_lookup(yNorm, W_GOTHIC, N_W_GOTHIC);
+
+        case GPU_CATENARY:
+            return xsect->wMax * gpu_lookup(yNorm, W_CATENARY, N_W_CATENARY);
+
+        case GPU_SEMIELLIPTICAL:
+            return xsect->wMax * gpu_lookup(yNorm, W_SEMIELLIP, N_W_SEMIELLIP);
+
+        case GPU_BASKETHANDLE:
+            return xsect->wMax * gpu_lookup(yNorm, W_BASKETHANDLE, N_W_BASKETHANDLE);
+
+        case GPU_SEMICIRCULAR:
+            return xsect->wMax * gpu_lookup(yNorm, W_SEMICIRC, N_W_SEMICIRC);
+
+        case GPU_HORIZ_ELLIPSE:
+            return xsect->wMax * gpu_lookup(yNorm, W_HORIZELLIPSE, N_W_HORIZELLIPSE);
+
+        case GPU_VERT_ELLIPSE:
+            return xsect->wMax * gpu_lookup(yNorm, W_VERTELLIPSE, N_W_VERTELLIPSE);
+
+        case GPU_ARCH:
+            return xsect->wMax * gpu_lookup(yNorm, W_ARCH, N_W_ARCH);
+
         default:
             // Linear approximation for unsupported shapes
-            return xsect->wMax * (y / xsect->yFull);
+            return xsect->wMax * yNorm;
     }
 }
 
@@ -344,21 +465,17 @@ __device__ double gpu_getWidth(
 
 __device__ double gpu_xsect_getAofY(GPU_Xsect* xsect, double y)
 //
-//  Purpose: Computes flow area for any cross-section type
-//  Input:   xsect = pointer to cross-section data
-//           y = flow depth (ft)
-//  Returns: Flow area (ft2)
-//
-//  Note: Simplified implementation for common shapes only
-//        Full implementation would use lookup tables for complex shapes
+//  Purpose: Computes flow area for all shapes using lookup tables where available
 //
 {
     if (y <= 0.0) return 0.0;
     if (y >= xsect->yFull) return xsect->aFull;
+    double yNorm = y / xsect->yFull;
 
     switch (xsect->type) {
         case GPU_CIRCULAR:
         case GPU_FILLED_CIRCULAR:
+        case GPU_FORCE_MAIN:
             return gpu_circular_getAofY(y, xsect->geom1);
 
         case GPU_RECT_CLOSED:
@@ -371,9 +488,27 @@ __device__ double gpu_xsect_getAofY(GPU_Xsect* xsect, double y)
         case GPU_TRIANGULAR:
             return gpu_trapezoidal_getAofY(y, 0.0, xsect->geom1);
 
+        case GPU_EGGSHAPED:
+            return xsect->aFull * gpu_lookup(yNorm, A_EGG, N_A_EGG);
+
+        case GPU_HORSESHOE:
+            return xsect->aFull * gpu_lookup(yNorm, A_HORSESHOE, N_A_HORSESHOE);
+
+        case GPU_BASKETHANDLE:
+            return xsect->aFull * gpu_lookup(yNorm, A_BASKETHANDLE, N_A_BASKETHANDLE);
+
+        case GPU_HORIZ_ELLIPSE:
+            return xsect->aFull * gpu_lookup(yNorm, A_HORIZELLIPSE, N_A_HORIZELLIPSE);
+
+        case GPU_VERT_ELLIPSE:
+            return xsect->aFull * gpu_lookup(yNorm, A_VERTELLIPSE, N_A_VERTELLIPSE);
+
+        case GPU_ARCH:
+            return xsect->aFull * gpu_lookup(yNorm, A_ARCH, N_A_ARCH);
+
         default:
-            // For unsupported shapes, use linear interpolation as approximation
-            return xsect->aFull * (y / xsect->yFull);
+            // For unsupported shapes, use linear interpolation
+            return xsect->aFull * yNorm;
     }
 }
 
@@ -381,18 +516,17 @@ __device__ double gpu_xsect_getAofY(GPU_Xsect* xsect, double y)
 
 __device__ double gpu_xsect_getRofY(GPU_Xsect* xsect, double y)
 //
-//  Purpose: Computes hydraulic radius for any cross-section type
-//  Input:   xsect = pointer to cross-section data
-//           y = flow depth (ft)
-//  Returns: Hydraulic radius (ft)
+//  Purpose: Computes hydraulic radius for all shapes using lookup tables where available
 //
 {
     if (y <= 0.0) return 0.0;
     if (y >= xsect->yFull) return xsect->rFull;
+    double yNorm = y / xsect->yFull;
 
     switch (xsect->type) {
         case GPU_CIRCULAR:
         case GPU_FILLED_CIRCULAR:
+        case GPU_FORCE_MAIN:
             return gpu_circular_getRofY(y, xsect->geom1);
 
         case GPU_RECT_CLOSED:
@@ -401,6 +535,24 @@ __device__ double gpu_xsect_getRofY(GPU_Xsect* xsect, double y)
 
         case GPU_TRAPEZOIDAL:
             return gpu_trapezoidal_getRofY(y, xsect->geom1, xsect->geom2);
+
+        case GPU_EGGSHAPED:
+            return xsect->rFull * gpu_lookup(yNorm, R_EGG, N_R_EGG);
+
+        case GPU_HORSESHOE:
+            return xsect->rFull * gpu_lookup(yNorm, R_HORSESHOE, N_R_HORSESHOE);
+
+        case GPU_BASKETHANDLE:
+            return xsect->rFull * gpu_lookup(yNorm, R_BASKETHANDLE, N_R_BASKETHANDLE);
+
+        case GPU_HORIZ_ELLIPSE:
+            return xsect->rFull * gpu_lookup(yNorm, R_HORIZELLIPSE, N_R_HORIZELLIPSE);
+
+        case GPU_VERT_ELLIPSE:
+            return xsect->rFull * gpu_lookup(yNorm, R_VERTELLIPSE, N_R_VERTELLIPSE);
+
+        case GPU_ARCH:
+            return xsect->rFull * gpu_lookup(yNorm, R_ARCH, N_R_ARCH);
 
         case GPU_TRIANGULAR:
             return gpu_trapezoidal_getRofY(y, 0.0, xsect->geom1);

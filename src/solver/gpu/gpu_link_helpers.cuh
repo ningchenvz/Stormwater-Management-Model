@@ -191,36 +191,105 @@ __device__ double gpu_xsect_getAofS(GPU_Xsect* xsect, double s)
 
         case GPU_CIRCULAR:
         case GPU_FORCE_MAIN:
-            // Use iterative solution for circular
-            // Start with approximation: A ≈ (s * D^(2/3))^(3/8)
+            // Use lookup table like CPU does (matches xsect.c::circ_getAofS)
             {
-                double d = xsect->yFull;  // Diameter
-                a = pow(s * pow(d, 2.0/3.0), 3.0/8.0);
+                extern __device__ const double S_CIRC[];
+                extern __device__ const int N_S_CIRC;
 
-                // Newton-Raphson refinement (max 20 iterations)
-                // Solve: S = A * R^(2/3) where R = A/P
-                for (int iter = 0; iter < 20; iter++)
-                {
-                    double r = gpu_xsect_getRofY(xsect, gpu_xsect_getYofA(xsect, a));
-                    double f = a * pow(r, 2.0/3.0) - s;
+                // Compute sFull = aFull * rFull^(2/3) for circular
+                double rFull = xsect->yFull / 4.0;
+                double sFull = xsect->aFull * pow(rFull, 2.0/3.0);
 
-                    if (fabs(f) < 0.001) break;  // Converged
+                double psi = s / sFull;
+                if (psi == 0.0) return 0.0;
+                if (psi >= 1.0) return xsect->aFull;
 
-                    // Approximate derivative
-                    double da = 0.01 * a;
-                    double a2 = a + da;
-                    double r2 = gpu_xsect_getRofY(xsect, gpu_xsect_getYofA(xsect, a2));
-                    double f2 = a2 * pow(r2, 2.0/3.0) - s;
-                    double df = (f2 - f) / da;
+                // Use lookup table for section factor inversion
+                a = xsect->aFull * gpu_invLookup(psi, S_CIRC, N_S_CIRC);
+            }
+            break;
 
-                    if (fabs(df) < 0.0001) break;
+        case GPU_EGGSHAPED:
+            {
+                extern __device__ const double S_EGG[];
+                extern __device__ const int N_S_EGG;
+                double sFull = xsect->aFull * pow(xsect->rFull, 2.0/3.0);
+                double psi = s / sFull;
+                if (psi == 0.0) return 0.0;
+                if (psi >= 1.0) return xsect->aFull;
+                a = xsect->aFull * gpu_invLookup(psi, S_EGG, N_S_EGG);
+            }
+            break;
 
-                    a -= f / df;
+        case GPU_HORSESHOE:
+            {
+                extern __device__ const double S_HORSESHOE[];
+                extern __device__ const int N_S_HORSESHOE;
+                double sFull = xsect->aFull * pow(xsect->rFull, 2.0/3.0);
+                double psi = s / sFull;
+                if (psi == 0.0) return 0.0;
+                if (psi >= 1.0) return xsect->aFull;
+                a = xsect->aFull * gpu_invLookup(psi, S_HORSESHOE, N_S_HORSESHOE);
+            }
+            break;
 
-                    // Keep in valid range
-                    if (a < 0.0) a = 0.001;
-                    if (a > xsect->aFull) a = xsect->aFull;
-                }
+        case GPU_GOTHIC:
+            {
+                extern __device__ const double S_GOTHIC[];
+                extern __device__ const int N_S_GOTHIC;
+                double sFull = xsect->aFull * pow(xsect->rFull, 2.0/3.0);
+                double psi = s / sFull;
+                if (psi == 0.0) return 0.0;
+                if (psi >= 1.0) return xsect->aFull;
+                a = xsect->aFull * gpu_invLookup(psi, S_GOTHIC, N_S_GOTHIC);
+            }
+            break;
+
+        case GPU_CATENARY:
+            {
+                extern __device__ const double S_CATENARY[];
+                extern __device__ const int N_S_CATENARY;
+                double sFull = xsect->aFull * pow(xsect->rFull, 2.0/3.0);
+                double psi = s / sFull;
+                if (psi == 0.0) return 0.0;
+                if (psi >= 1.0) return xsect->aFull;
+                a = xsect->aFull * gpu_invLookup(psi, S_CATENARY, N_S_CATENARY);
+            }
+            break;
+
+        case GPU_SEMIELLIPTICAL:
+            {
+                extern __device__ const double S_SEMIELLIP[];
+                extern __device__ const int N_S_SEMIELLIP;
+                double sFull = xsect->aFull * pow(xsect->rFull, 2.0/3.0);
+                double psi = s / sFull;
+                if (psi == 0.0) return 0.0;
+                if (psi >= 1.0) return xsect->aFull;
+                a = xsect->aFull * gpu_invLookup(psi, S_SEMIELLIP, N_S_SEMIELLIP);
+            }
+            break;
+
+        case GPU_BASKETHANDLE:
+            {
+                extern __device__ const double S_BASKETHANDLE[];
+                extern __device__ const int N_S_BASKETHANDLE;
+                double sFull = xsect->aFull * pow(xsect->rFull, 2.0/3.0);
+                double psi = s / sFull;
+                if (psi == 0.0) return 0.0;
+                if (psi >= 1.0) return xsect->aFull;
+                a = xsect->aFull * gpu_invLookup(psi, S_BASKETHANDLE, N_S_BASKETHANDLE);
+            }
+            break;
+
+        case GPU_SEMICIRCULAR:
+            {
+                extern __device__ const double S_SEMICIRC[];
+                extern __device__ const int N_S_SEMICIRC;
+                double sFull = xsect->aFull * pow(xsect->rFull, 2.0/3.0);
+                double psi = s / sFull;
+                if (psi == 0.0) return 0.0;
+                if (psi >= 1.0) return xsect->aFull;
+                a = xsect->aFull * gpu_invLookup(psi, S_SEMICIRC, N_S_SEMICIRC);
             }
             break;
 
@@ -331,32 +400,79 @@ __device__ double gpu_xsect_getYofA(GPU_Xsect* xsect, double a)
 
         case GPU_CIRCULAR:
         case GPU_FORCE_MAIN:
-            // For circular: Use inverse of area formula
-            // Iterative solution since no closed form
+            // Use lookup table like CPU does (matches xsect.c::circ_getYofA)
             {
-                double d = xsect->yFull;  // Diameter
+                extern __device__ const double Y_CIRC[];
+                extern __device__ const int N_Y_CIRC;
+
                 double alpha = a / xsect->aFull;
 
-                // Initial guess: y ≈ d * alpha (linear approximation)
-                y = d * alpha;
+                // Use special function for small a/aFull (alpha < 0.04)
+                // For now, just use lookup table for all values
+                y = xsect->yFull * gpu_lookup(alpha, Y_CIRC, N_Y_CIRC);
+            }
+            break;
 
-                // Newton-Raphson refinement
-                for (int iter = 0; iter < 20; iter++)
-                {
-                    double a_calc = gpu_xsect_getAofY(xsect, y);
-                    double f = a_calc - a;
+        case GPU_EGGSHAPED:
+            {
+                extern __device__ const double Y_EGG[];
+                extern __device__ const int N_Y_EGG;
+                double alpha = a / xsect->aFull;
+                y = xsect->yFull * gpu_lookup(alpha, Y_EGG, N_Y_EGG);
+            }
+            break;
 
-                    if (fabs(f) < 0.001) break;  // Converged
+        case GPU_HORSESHOE:
+            {
+                extern __device__ const double Y_HORSESHOE[];
+                extern __device__ const int N_Y_HORSESHOE;
+                double alpha = a / xsect->aFull;
+                y = xsect->yFull * gpu_lookup(alpha, Y_HORSESHOE, N_Y_HORSESHOE);
+            }
+            break;
 
-                    // dA/dy = W (top width)
-                    double w = gpu_xsect_getWofY(xsect, y);
-                    if (w < 0.0001) break;
+        case GPU_GOTHIC:
+            {
+                extern __device__ const double Y_GOTHIC[];
+                extern __device__ const int N_Y_GOTHIC;
+                double alpha = a / xsect->aFull;
+                y = xsect->yFull * gpu_lookup(alpha, Y_GOTHIC, N_Y_GOTHIC);
+            }
+            break;
 
-                    y -= f / w;
+        case GPU_CATENARY:
+            {
+                extern __device__ const double Y_CATENARY[];
+                extern __device__ const int N_Y_CATENARY;
+                double alpha = a / xsect->aFull;
+                y = xsect->yFull * gpu_lookup(alpha, Y_CATENARY, N_Y_CATENARY);
+            }
+            break;
 
-                    if (y < 0.0) y = 0.001;
-                    if (y > d) y = d * 0.999;
-                }
+        case GPU_SEMIELLIPTICAL:
+            {
+                extern __device__ const double Y_SEMIELLIP[];
+                extern __device__ const int N_Y_SEMIELLIP;
+                double alpha = a / xsect->aFull;
+                y = xsect->yFull * gpu_lookup(alpha, Y_SEMIELLIP, N_Y_SEMIELLIP);
+            }
+            break;
+
+        case GPU_BASKETHANDLE:
+            {
+                extern __device__ const double Y_BASKETHANDLE[];
+                extern __device__ const int N_Y_BASKETHANDLE;
+                double alpha = a / xsect->aFull;
+                y = xsect->yFull * gpu_lookup(alpha, Y_BASKETHANDLE, N_Y_BASKETHANDLE);
+            }
+            break;
+
+        case GPU_SEMICIRCULAR:
+            {
+                extern __device__ const double Y_SEMICIRC[];
+                extern __device__ const int N_Y_SEMICIRC;
+                double alpha = a / xsect->aFull;
+                y = xsect->yFull * gpu_lookup(alpha, Y_SEMICIRC, N_Y_SEMICIRC);
             }
             break;
 
