@@ -51,6 +51,25 @@ static double* g_prevNodeNewDepth = NULL;
 static int g_prevNodeCapacity = 0;
 static double* g_prevNodeNewVolume = NULL;
 
+// Link contributions for deterministic two-stage accumulation
+static GPU_LinkContributions g_linkContributions = {0};
+static int g_linkContributions_initialized = 0;
+
+// DEBUG: Global device routing step counter for depth calculation tracing
+__device__ int g_depthRoutingStepCounter = 0;
+
+__global__ void kernel_incrementDepthRoutingStepCounter() {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        g_depthRoutingStepCounter++;
+    }
+}
+
+__global__ void kernel_resetDepthRoutingStepCounter() {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        g_depthRoutingStepCounter = 0;
+    }
+}
+
 static int ensureDeviceCurvePointers(void)
 {
     if (g_gpuCurves.count > 0 && g_gpuDeviceCurves == NULL) {
@@ -159,6 +178,89 @@ __global__ void kernel_resetNodeAccumulators(
     }
 
     nodes->d_newSurfArea[i] = baseArea;
+}
+
+//=============================================================================
+// Kernel: Accumulate Link Contributions (Stage 2 of two-stage accumulation)
+//=============================================================================
+// Purpose: Sum link contributions into node accumulators in CPU-matching order
+//          to ensure bit-identical floating-point results
+//
+// This eliminates non-deterministic atomicAdd ordering that caused 3-9% depth
+// differences between GPU and CPU, leading to poor Picard convergence.
+//
+__global__ void kernel_accumulateNodeContributions(
+    GPU_NodeData* nodes,
+    GPU_LinkContribution* contributions,
+    GPU_LinkData* links,
+    int numLinks)
+//
+//  Input:   nodes = node data structure
+//           contributions = per-link contribution arrays (written by link kernels)
+//           links = link data structure (for node connectivity)
+//           numLinks = total number of links
+//
+//  Output:  Updates nodes->d_inflow, d_outflow, d_newSurfArea, d_sumdqdh
+//
+//  Notes:   Links are processed in the order they appear in the links array,
+//           which matches the CPU's sorted link order (SortedLinks array)
+//
+{
+    int nodeIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (nodeIdx >= nodes->count) return;
+
+    double inflow = nodes->d_inflow[nodeIdx];      // Start with lateral inflow (from resetNodeAccumulators)
+    double outflow = nodes->d_outflow[nodeIdx];    // Start with losses (from resetNodeAccumulators)
+    double surfArea = nodes->d_newSurfArea[nodeIdx];  // Start with intrinsic surface area
+    double sumdqdh = nodes->d_sumdqdh[nodeIdx];    // Start at 0 (from resetNodeAccumulators)
+
+    // DEBUG: Log initial values for node 1 (J2) at step 1
+    if (nodeIdx == 1 && g_depthRoutingStepCounter == 1) {
+        printf("  GPU_ACCUM_INIT: node%d starting surfArea=%.6f (from resetNodeAccumulators)\n",
+               nodeIdx, surfArea);
+    }
+
+    // Accumulate contributions from all links in CPU order (serial loop is OK - only ~10-100 links per node)
+    // CRITICAL: Links are processed in array order, matching CPU's SortedLinks traversal
+    for (int linkIdx = 0; linkIdx < numLinks; linkIdx++) {
+        int n1 = links->d_node1[linkIdx];  // Upstream node
+        int n2 = links->d_node2[linkIdx];  // Downstream node
+
+        GPU_LinkContribution* c = &contributions[linkIdx];
+
+        // Check if this link contributes to current node
+        if (n1 == nodeIdx) {
+            // This node is upstream end of link
+            // DEBUG: Log contributions to node 1 (J2) during first routing step
+            if (nodeIdx == 1 && g_depthRoutingStepCounter == 1) {
+                printf("  GPU_ACCUM_DETAIL: link%d(n1=%d n2=%d)→node%d AS UPSTREAM: surfA+=%.6f (was %.6f now %.6f)\n",
+                       linkIdx, n1, n2, nodeIdx, c->node1_surfArea, surfArea, surfArea + c->node1_surfArea);
+            }
+            inflow += c->node1_inflow;
+            outflow += c->node1_outflow;
+            surfArea += c->node1_surfArea;
+            sumdqdh += c->node1_sumdqdh;
+        }
+        else if (n2 == nodeIdx) {
+            // This node is downstream end of link
+            // DEBUG: Log contributions to node 1 (J2) during first routing step
+            if (nodeIdx == 1 && g_depthRoutingStepCounter == 1) {
+                printf("  GPU_ACCUM_DETAIL: link%d(n1=%d n2=%d)→node%d AS DOWNSTREAM: surfA+=%.6f (was %.6f now %.6f)\n",
+                       linkIdx, n1, n2, nodeIdx, c->node2_surfArea, surfArea, surfArea + c->node2_surfArea);
+            }
+            inflow += c->node2_inflow;
+            outflow += c->node2_outflow;
+            surfArea += c->node2_surfArea;
+            sumdqdh += c->node2_sumdqdh;
+        }
+        // else: link doesn't connect to this node, skip
+    }
+
+    // Write final accumulated values (atomic-free, deterministic)
+    nodes->d_inflow[nodeIdx] = inflow;
+    nodes->d_outflow[nodeIdx] = outflow;
+    nodes->d_newSurfArea[nodeIdx] = surfArea;
+    nodes->d_sumdqdh[nodeIdx] = sumdqdh;
 }
 
 //=============================================================================
@@ -318,20 +420,27 @@ __global__ void kernel_findNodeDepths(
     nodes->d_oldSurfArea[i] = oldSurfArea;
     nodes->d_dYdT[i] = dYdT;
 
+    // DEBUG: Track divergence for J2 (node index 1) during routing steps 0-3
+    if (i == 1 && g_depthRoutingStepCounter >= 0 && g_depthRoutingStepCounter <= 3 && steps <= 3) {
+        printf("GPU_DIVERGE[routeStep=%d iter=%d node=J2]: inflow=%.6f outflow=%.6f oldDepth=%.6f newDepth=%.6f oldVol=%.6f newVol=%.6f\n",
+               g_depthRoutingStepCounter, steps,
+               nodes->d_inflow[i], nodes->d_outflow[i],
+               nodes->d_oldDepth[i], newDepth,
+               nodes->d_oldVolume[i], newVolume);
+    }
+
     // Check convergence
     double depthChange = fabs(newDepth - yOld);
     nodes->d_converged[i] = (depthChange <= headTol) ? 1 : 0;
 
-    // DEBUG: Trace convergence for problem storage nodes (first 3 Picard iterations only)
-    #ifdef GPU_DEBUG_SURF
-    if ((i == 926 || i == 927 || i == 928) && steps <= 3 && !nodes->d_converged[i]) {
-        printf("CONVERGE_FAIL[step=%d node=%d]: depthChange=%.6f > headTol=%.6f (%.1fx)\n",
-               steps, i, depthChange, headTol, depthChange / headTol);
-        printf("  yOld=%.6f → newDepth=%.6f (Δ=%.6f ft)\n", yOld, newDepth, depthChange);
-        printf("  nodeType=%d inflow=%.6f outflow=%.6f\n",
-               nodes->d_type[i], nodes->d_inflow[i], nodes->d_outflow[i]);
+    // DEBUG: Log non-converging nodes for routing steps 1-5, iterations 0-8
+    if (g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 5 && steps <= 8 && !nodes->d_converged[i]) {
+        printf("  GPU_NODE_FAIL[routingStep=%d iter=%d node=%d type=%d]: depthChange=%.6f > tol=%.6f (%.1fx) depth: %.6f→%.6f in=%.3f out=%.3f\n",
+               g_depthRoutingStepCounter, steps, i, nodes->d_type[i],
+               depthChange, headTol, depthChange / headTol,
+               yOld, newDepth,
+               nodes->d_inflow[i], nodes->d_outflow[i]);
     }
-    #endif
 }
 
 //=============================================================================
@@ -438,6 +547,49 @@ static int ensureNodeKernelContext(void)
     return 0;
 }
 
+//=============================================================================
+// Initialize link contributions for two-stage deterministic accumulation
+//=============================================================================
+static int ensureLinkContributionsInitialized(int linkCount)
+{
+    if (linkCount <= 0) return -1;
+
+    // Check if already initialized with correct size
+    if (g_linkContributions_initialized && g_linkContributions.count == linkCount) {
+        return 0;
+    }
+
+    // Free existing allocation if size changed
+    if (g_linkContributions_initialized) {
+        if (g_linkContributions.d_contributions) {
+            cudaFree(g_linkContributions.d_contributions);
+            g_linkContributions.d_contributions = NULL;
+        }
+        if (g_linkContributions.h_contributions) {
+            cudaFreeHost(g_linkContributions.h_contributions);
+            g_linkContributions.h_contributions = NULL;
+        }
+        g_linkContributions_initialized = 0;
+    }
+
+    // Allocate new buffers
+    size_t bytes = linkCount * sizeof(GPU_LinkContribution);
+
+    // Device memory
+    CUDA_CHECK(cudaMalloc((void**)&g_linkContributions.d_contributions, bytes));
+
+    // Host pinned memory (for debugging/verification)
+    CUDA_CHECK(cudaMallocHost((void**)&g_linkContributions.h_contributions, bytes));
+
+    g_linkContributions.count = linkCount;
+    g_linkContributions_initialized = 1;
+
+    printf("GPU: Initialized link contributions buffer for %d links (%.2f KB)\n",
+           linkCount, bytes / 1024.0);
+
+    return 0;
+}
+
 static void copyNodesToGpu(GPU_NodeData* nodes)
 {
     int count = nodes->count;
@@ -466,6 +618,14 @@ static void copyNodesToGpu(GPU_NodeData* nodes)
         nodes->h_dYdT[i]        = Xnode[i].dYdT;
         nodes->h_newLatFlow[i]  = Node[i].newLatFlow;
         nodes->h_losses[i]      = Node[i].losses;
+
+        // DEBUG: Log J2 (node 1) old/new depth during copy for first 5 routing steps
+        static int copyStepCounter = 0;
+        if (i == 1 && copyStepCounter < 5) {
+            printf("COPY_TO_GPU[step=%d node=J2]: CPU oldDepth=%.6f newDepth=%.6f → GPU h_oldDepth=%.6f h_newDepth=%.6f\n",
+                   copyStepCounter, Node[i].oldDepth, Node[i].newDepth, nodes->h_oldDepth[i], nodes->h_newDepth[i]);
+        }
+        if (i == count - 1) copyStepCounter++;  // Increment after processing last node
 
         nodes->h_storageA0[i]    = 0.0;
         nodes->h_storageA1[i]    = 0.0;
@@ -500,7 +660,7 @@ static void copyNodesToGpu(GPU_NodeData* nodes)
     gpu_transferNodeDynamicToDevice(nodes, nodes->count);
 }
 
-static void copyNodesFromGpu(GPU_NodeData* nodes)
+static void copyNodesFromGpu(GPU_NodeData* nodes, int copyDepthAndVolume)
 {
     int count = nodes->count;
     static int call_count = 0;
@@ -567,12 +727,19 @@ static void copyNodesFromGpu(GPU_NodeData* nodes)
                 }
             }
 
-            Node[i].newVolume = newVolume;
+            // CRITICAL: Only copy newVolume at END of Picard loop (final converged values)
+            // Do NOT copy during intermediate iterations - it corrupts the state for next routing step!
+            if (copyDepthAndVolume) {
+                Node[i].newVolume = newVolume;
+            }
             Node[i].overflow  = nodes->h_overflow[i];
         }
 
-        // Always copy depth (including for outfalls, which are set by GPU outfall kernel)
-        Node[i].newDepth = newDepth;
+        // CRITICAL: Only copy newDepth at END of Picard loop (final converged values)
+        // Do NOT copy during intermediate iterations - it corrupts the depth state for next routing step!
+        if (copyDepthAndVolume) {
+            Node[i].newDepth = newDepth;
+        }
 
         // Copy inflow/outflow for statistics tracking
         Node[i].inflow = nodes->h_inflow[i];
@@ -715,6 +882,12 @@ extern "C" int gpu_runNodeDepthKernel(
     cudaStream_t stream = gpu_getStream();
     GPU_NodeData* nodes = &g_nodeKernelCtx.data;
 
+    // DEBUG: Increment routing step counter at start of each new routing step
+    if (steps == 0) {
+        kernel_incrementDepthRoutingStepCounter<<<1, 1, 0, stream>>>();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
     if (g_prevNodeCapacity != nodes->count) {
         if (g_prevNodeNewDepth) {
             free(g_prevNodeNewDepth);
@@ -761,7 +934,8 @@ extern "C" int gpu_runNodeDepthKernel(
     cudaEventElapsedTime(&elapsedMs, g_nodeKernelStartEvent, g_nodeKernelStopEvent);
     gpu_profiler_addKernelTime((double)elapsedMs);
 
-    copyNodesFromGpu(nodes);
+    // During Picard iteration: only copy inflow/outflow, NOT depth/volume (prevents state corruption)
+    copyNodesFromGpu(nodes, 0);
 
     // DISABLED: CPU storage recompute fallback - let GPU handle storage nodes
     if (0 && g_prevNodeNewDepth) {
@@ -954,6 +1128,7 @@ extern int launchLinkFlowKernels(
     GPU_OutletData* d_gpuOutlets,
     GPU_CurveData* d_gpuCurves,
     GPU_CurvePoints* d_gpuCurvePoints,
+    GPU_LinkContribution* d_contributions,
     double dt,
     int steps,
     double omega,
@@ -962,11 +1137,14 @@ extern int launchLinkFlowKernels(
     int inertDamping,
     cudaStream_t stream);
 
+// DEBUG: Helper to increment routing step counter (for inflow tracing)
+extern __global__ void kernel_incrementRoutingStepCounter();
+
 extern void copyNodesToGpu(GPU_NodeData* nodes);
 extern void copyLinksToGpu(GPU_LinkData* links);
 extern void copyConduitsToGpu(GPU_ConduitData* conduits);
 extern void copyXsectsToGpu(GPU_XsectData* xsects);
-extern void copyNodesFromGpu(GPU_NodeData* nodes);
+static void copyNodesFromGpu(GPU_NodeData* nodes, int copyDepthAndVolume);
 extern void copyLinkIterStateFromGpu(GPU_LinkData* links);
 
 extern int gpu_transferLinkIterationResultsFromDevice(GPU_LinkData* links, int count);
@@ -1086,6 +1264,11 @@ extern "C" int gpu_runPersistentPicardIteration(
     CUDA_CHECK(cudaMemcpy(d_xsects, xsects, sizeof(GPU_XsectData), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_nodes, nodes, sizeof(GPU_NodeData), cudaMemcpyHostToDevice));
 
+    // Initialize link contributions buffer for two-stage deterministic accumulation
+    if (ensureLinkContributionsInitialized(links->count) != 0) {
+        return -1;
+    }
+
     // DEBUG: Log dt value for first few routing steps
     static int routingStepCount = 0;
     if (routingStepCount < 10) {
@@ -1103,6 +1286,17 @@ extern "C" int gpu_runPersistentPicardIteration(
     int converged = 0;
     double crownCutoff = (surchargeMethod == EXTRAN) ? EXTRAN_CROWN_CUTOFF : SLOT_CROWN_CUTOFF;
 
+    // DEBUG: Track convergence statistics for first few routing steps
+    static int routingStepNum = 0;
+
+    // DEBUG: Increment device-side routing step counter for inflow tracing
+    kernel_incrementRoutingStepCounter<<<1, 1, 0, stream>>>();
+    CUDA_CHECK_LAST_ERROR();
+
+    // DEBUG: Increment depth routing step counter for node depth tracing
+    kernel_incrementDepthRoutingStepCounter<<<1, 1, 0, stream>>>();
+    CUDA_CHECK_LAST_ERROR();
+
     for (iter = 0; iter < maxIterations; iter++) {
         // === RESET ACCUMULATORS (before link flows) ===
         // This mirrors CPU's initNodeStates() which zeros inflow/outflow/surfArea/sumdqdh
@@ -1110,16 +1304,25 @@ extern "C" int gpu_runPersistentPicardIteration(
         int blockSize = DEFAULT_BLOCK_SIZE;
         int gridSize = GRID_SIZE(nodes->count, blockSize);
         kernel_resetNodeAccumulators<<<gridSize, blockSize, 0, stream>>>(
-            d_nodes, allowPonding, iter + 1,
+            d_nodes, allowPonding, iter,
             UCF(LENGTH), d_gpuCurves, d_gpuCurvePoints);
         CUDA_CHECK_LAST_ERROR();
 
+        // === ZERO OUT LINK CONTRIBUTIONS BUFFER ===
+        // CRITICAL: Must clear contributions from previous iteration
+        size_t contribBytes = links->count * sizeof(GPU_LinkContribution);
+        CUDA_CHECK(cudaMemsetAsync(g_linkContributions.d_contributions, 0, contribBytes, stream));
+
         // === LINK FLOWS (device-resident kernel launches) ===
+        // CRITICAL FIX: Pass 'iter' not 'iter+1' to match CPU behavior
+        // CPU increments Steps AFTER calling findLinkFlows(), so first iteration uses Steps=0
+        // STAGE 1: Each link writes contributions (NO atomics)
         if (launchLinkFlowKernels(
                 d_links, d_conduits, d_xsects, d_nodes,
                 d_gpuPumps, d_gpuOrifices, d_gpuWeirs, d_gpuOutlets,
                 d_gpuCurves, d_gpuCurvePoints,
-                dt, iter + 1, omega,
+                g_linkContributions.d_contributions,
+                dt, iter, omega,
                 surchargeMethod, crownCutoff, InertDamping,
                 stream) != 0)
         {
@@ -1148,6 +1351,24 @@ extern "C" int gpu_runPersistentPicardIteration(
         }
         if (iter == maxIterations - 1) picardStepCount++;
 
+        // === STAGE 2: ACCUMULATE LINK CONTRIBUTIONS (deterministic summation) ===
+        // Sum link contributions into node accumulators in CPU-matching order
+        // This replaces non-deterministic atomicAdd calls in link kernels
+        static int accumDebugCount = 0;
+        if (accumDebugCount < 3 && iter == 0) {
+            printf("  GPU_ACCUM[step=%d iter=%d]: Launching accumulation kernel for %d nodes, %d links\n",
+                   routingStepNum, iter, nodes->count, links->count);
+        }
+        if (iter == maxIterations - 1) accumDebugCount++;
+
+        gridSize = GRID_SIZE(nodes->count, blockSize);
+        kernel_accumulateNodeContributions<<<gridSize, blockSize, 0, stream>>>(
+            d_nodes,
+            g_linkContributions.d_contributions,
+            d_links,
+            links->count);
+        CUDA_CHECK_LAST_ERROR();
+
         // === OUTFALL DEPTHS (set boundary conditions based on link flows) ===
         // This mirrors CPU's link_setOutfallDepth() at dynwave.c:817
         // Must be called AFTER link flows are computed but BEFORE node depths
@@ -1157,9 +1378,10 @@ extern "C" int gpu_runPersistentPicardIteration(
         CUDA_CHECK_LAST_ERROR();
 
         // === NODE DEPTHS (device-resident with convergence check) ===
+        // CRITICAL FIX: Pass 'iter' not 'iter+1' to match CPU behavior
         if (gpu_computeNodeDepthsWithConvergence(
                 nodes, dt, allowPonding, surchargeMethod,
-                minSurfArea, iter + 1, omega, headTol,
+                minSurfArea, iter, omega, headTol,
                 d_convergedCount, stream) != 0)
         {
             cudaFree(d_convergedCount);
@@ -1170,6 +1392,12 @@ extern "C" int gpu_runPersistentPicardIteration(
         CUDA_CHECK(cudaMemcpy(&h_convergedCount, d_convergedCount,
                               sizeof(int), cudaMemcpyDeviceToHost));
 
+        // DEBUG: Log convergence progress for first few routing steps
+        if (routingStepNum < 5 && iter < 10) {
+            printf("  GPU_CONVERGE[step=%d iter=%d]: %d/%d nodes converged\n",
+                   routingStepNum, iter, h_convergedCount, nodes->count);
+        }
+
         // Check if all nodes converged
         if (iter > 0 && h_convergedCount == nodes->count) {
             converged = 1;
@@ -1177,14 +1405,34 @@ extern "C" int gpu_runPersistentPicardIteration(
         }
     }
 
+    // DEBUG: Log final convergence status
+    if (routingStepNum < 5) {
+        printf("  GPU_PICARD_COMPLETE[step=%d]: %d iterations, converged=%d\n",
+               routingStepNum, iter + 1, converged);
+    }
+    routingStepNum++;
+
     // Synchronize before transferring results
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Final transfer: Copy ALL results back to CPU ONCE
+    // Final transfer: Copy ALL results back to CPU ONCE (including final converged depth/volume)
     gpu_transferLinkIterationResultsFromDevice(links, links->count);
     gpu_transferNodeIterationStateFromDevice(nodes, nodes->count);
+
+    // DEBUG: Log depths before final copy
+    if (routingStepNum < 3) {
+        printf("  BEFORE FINAL COPY[step=%d]: GPU h_newDepth[1]=%.6f, CPU Node[1].newDepth=%.6f\n",
+               routingStepNum, nodes->h_newDepth[1], Node[1].newDepth);
+    }
+
     copyLinkIterStateFromGpu(links);
-    copyNodesFromGpu(nodes);
+    copyNodesFromGpu(nodes, 1);  // 1 = copy depth/volume (final converged values)
+
+    // DEBUG: Log depths after final copy
+    if (routingStepNum < 3) {
+        printf("  AFTER FINAL COPY[step=%d]: CPU Node[1].newDepth=%.6f\n",
+               routingStepNum, Node[1].newDepth);
+    }
 
     // Optional: Surface area diagnostic (enable with SWMM_DEBUG_SURF_AREA=1)
     static int diagnostic_enabled = -1;
@@ -1208,6 +1456,20 @@ extern "C" int gpu_runPersistentPicardIteration(
     // Mark conduit results as dirty so gpu_flushConduitResults() will process them
     // This is CRITICAL for variable timestep calculation which needs current link flows
     g_conduitKernelCtx.resultsDirty = 1;
+
+    // CRITICAL FIX: Copy final converged node depths/volumes back to CPU
+    // Without this, the CPU Node[] array has stale values, causing wrong oldDepth
+    // to be used at the start of the next routing step!
+    gpu_transferNodeIterationStateFromDevice(nodes, nodes->count);
+    copyNodesFromGpu(nodes, 1);  // 1 = copy depth/volume (final converged values)
+
+    // DEBUG: Log final depth transfer
+    static int persistentStepNum = 0;
+    if (persistentStepNum < 5) {
+        printf("  PERSISTENT_FINAL_COPY[step=%d iter=%d]: GPU depth[1]=%.6f → CPU Node[1].newDepth=%.6f\n",
+               persistentStepNum, iter + 1, nodes->h_newDepth[1], Node[1].newDepth);
+    }
+    persistentStepNum++;
 
     // Cleanup
     cudaFree(d_convergedCount);

@@ -26,6 +26,13 @@
 #include "gpu_link_helpers.cuh"
 
 //-----------------------------------------------------------------------------
+// External device variables
+//-----------------------------------------------------------------------------
+extern __device__ int g_routingStepCounter;
+extern __device__ int g_accumRoutingStepCounter;
+extern __device__ int g_gpu_surf_logged;
+
+//-----------------------------------------------------------------------------
 // Constants
 //-----------------------------------------------------------------------------
 #define GPU_MAXVELOCITY     50.0     // Maximum velocity (ft/sec)
@@ -389,6 +396,166 @@ __device__ double gpu_link_getFroude(
 }
 
 //=============================================================================
+// GPU version of findSurfArea (from dwflow.c:443)
+// Adjusts flow depths based on flow classification (critical/normal depth)
+//=============================================================================
+
+__device__ void gpu_findSurfArea(
+    int linkIdx,
+    GPU_Xsect* xsect,
+    double q,
+    double length,
+    double offset1,
+    double offset2,
+    int node1_type,
+    int node2_type,
+    double node1_invertElev,
+    double node2_invertElev,
+    double beta,
+    double qMax,
+    int surchargeMethod,
+    double crownCutoff,
+    double* h1,
+    double* h2,
+    double* y1,
+    double* y2,
+    double* surfArea1_out,
+    double* surfArea2_out,
+    int* flowClass_out)
+//
+//  Purpose: Adjusts flow depths based on flow regime and computes surface areas
+//  Note: GPU port of CPU dwflow.c::findSurfArea()
+//
+{
+    double flowDepth1 = *y1;
+    double flowDepth2 = *y2;
+    double flowDepthMid;
+    double width1, width2, widthMid;
+    double surfArea1 = 0.0;
+    double surfArea2 = 0.0;
+    double criticalDepth;
+    double normalDepth;
+    double fullDepth = xsect->yFull;
+    double fasnh = 1.0;
+    int flowClass;
+
+    // Initialize normal/critical depths
+    normalDepth = (flowDepth1 + flowDepth2) / 2.0;
+    criticalDepth = normalDepth;
+
+    // Determine flow classification
+    if (flowDepth1 >= fullDepth && flowDepth2 >= fullDepth) {
+        flowClass = GPU_SUBCRITICAL;
+    } else {
+        // Note: node depths are derived from heads - we don't have separate node depth params
+        double node1_depth = *h1 - node1_invertElev;
+        double node2_depth = *h2 - node2_invertElev;
+        flowClass = gpu_getFlowClass(
+            q, *h1, *h2, *y1, *y2,
+            offset1, offset2,
+            node1_type, node2_type,
+            node1_depth, node2_depth,
+            node1_invertElev, node2_invertElev,
+            xsect, beta, qMax,
+            &criticalDepth, &normalDepth, &fasnh);
+    }
+
+    // Adjust depths and compute surface areas based on flow class
+    switch (flowClass) {
+        case GPU_SUBCRITICAL:
+            flowDepthMid = 0.5 * (flowDepth1 + flowDepth2);
+            if (flowDepthMid < GPU_FUDGE) flowDepthMid = GPU_FUDGE;
+            width1 = gpu_getWidth(xsect, flowDepth1, surchargeMethod, crownCutoff);
+            width2 = gpu_getWidth(xsect, flowDepth2, surchargeMethod, crownCutoff);
+            widthMid = gpu_getWidth(xsect, flowDepthMid, surchargeMethod, crownCutoff);
+            surfArea1 = (width1 + widthMid) * length / 4.0;
+            surfArea2 = (widthMid + width2) * length / 4.0 * fasnh;
+
+            // DEBUG: Log width calculations for Link 1 on first call only
+            if (linkIdx == 1 && atomicCAS(&g_gpu_surf_logged, 0, 1) == 0) {
+                printf("  GPU_FINDSURF link%d GPU_SUBCRITICAL: flowDepth1=%.6f flowDepth2=%.6f flowDepthMid=%.6f\n",
+                       linkIdx, flowDepth1, flowDepth2, flowDepthMid);
+                printf("    width1=%.6f widthMid=%.6f length=%.3f\n", width1, widthMid, length);
+                printf("    surfArea1=(%.6f + %.6f)*%.3f/4 = %.6f\n", width1, widthMid, length, surfArea1);
+            }
+            break;
+
+        case GPU_UP_CRITICAL:
+            flowDepth1 = criticalDepth;
+            if (normalDepth < criticalDepth) flowDepth1 = normalDepth;
+            flowDepth1 = gpu_MAX(flowDepth1, GPU_FUDGE);
+            *h1 = node1_invertElev + offset1 + flowDepth1;
+            flowDepthMid = 0.5 * (flowDepth1 + flowDepth2);
+            if (flowDepthMid < GPU_FUDGE) flowDepthMid = GPU_FUDGE;
+            width2 = gpu_getWidth(xsect, flowDepth2, surchargeMethod, crownCutoff);
+            widthMid = gpu_getWidth(xsect, flowDepthMid, surchargeMethod, crownCutoff);
+            surfArea2 = (widthMid + width2) * length * 0.5;
+            break;
+
+        case GPU_DN_CRITICAL:
+            flowDepth2 = criticalDepth;
+            if (normalDepth < criticalDepth) flowDepth2 = normalDepth;
+            flowDepth2 = gpu_MAX(flowDepth2, GPU_FUDGE);
+            *h2 = node2_invertElev + offset2 + flowDepth2;
+            width1 = gpu_getWidth(xsect, flowDepth1, surchargeMethod, crownCutoff);
+            flowDepthMid = 0.5 * (flowDepth1 + flowDepth2);
+            if (flowDepthMid < GPU_FUDGE) flowDepthMid = GPU_FUDGE;
+            widthMid = gpu_getWidth(xsect, flowDepthMid, surchargeMethod, crownCutoff);
+            surfArea1 = (width1 + widthMid) * length * 0.5;
+            break;
+
+        case GPU_UP_DRY:
+            flowDepth1 = GPU_FUDGE;
+            flowDepthMid = 0.5 * (flowDepth1 + flowDepth2);
+            if (flowDepthMid < GPU_FUDGE) flowDepthMid = GPU_FUDGE;
+            width1 = gpu_getWidth(xsect, flowDepth1, surchargeMethod, crownCutoff);
+            width2 = gpu_getWidth(xsect, flowDepth2, surchargeMethod, crownCutoff);
+            widthMid = gpu_getWidth(xsect, flowDepthMid, surchargeMethod, crownCutoff);
+            surfArea2 = (widthMid + width2) * length / 4.0;
+            if (offset1 <= 0.0) {
+                surfArea1 = (width1 + widthMid) * length / 4.0;
+            }
+            break;
+
+        case GPU_DN_DRY:
+            flowDepth2 = GPU_FUDGE;
+            flowDepthMid = 0.5 * (flowDepth1 + flowDepth2);
+            if (flowDepthMid < GPU_FUDGE) flowDepthMid = GPU_FUDGE;
+            width1 = gpu_getWidth(xsect, flowDepth1, surchargeMethod, crownCutoff);
+            width2 = gpu_getWidth(xsect, flowDepth2, surchargeMethod, crownCutoff);
+            widthMid = gpu_getWidth(xsect, flowDepthMid, surchargeMethod, crownCutoff);
+            surfArea1 = (widthMid + width1) * length / 4.0;
+            if (offset2 <= 0.0) {
+                surfArea2 = (width2 + widthMid) * length / 4.0;
+            }
+            break;
+
+        case GPU_DRY:
+            surfArea1 = GPU_FUDGE * length / 2.0;
+            surfArea2 = surfArea1;
+            break;
+
+        default:
+            // SUPCRITICAL or unknown - treat as SUBCRITICAL
+            flowDepthMid = 0.5 * (flowDepth1 + flowDepth2);
+            if (flowDepthMid < GPU_FUDGE) flowDepthMid = GPU_FUDGE;
+            width1 = gpu_getWidth(xsect, flowDepth1, surchargeMethod, crownCutoff);
+            width2 = gpu_getWidth(xsect, flowDepth2, surchargeMethod, crownCutoff);
+            widthMid = gpu_getWidth(xsect, flowDepthMid, surchargeMethod, crownCutoff);
+            surfArea1 = (width1 + widthMid) * length / 4.0;
+            surfArea2 = (widthMid + width2) * length / 4.0;
+            break;
+    }
+
+    // Return adjusted depths and computed values
+    *y1 = flowDepth1;
+    *y2 = flowDepth2;
+    *surfArea1_out = surfArea1;
+    *surfArea2_out = surfArea2;
+    *flowClass_out = flowClass;
+}
+
+//=============================================================================
 
 __device__ void gpu_findConduitFlow_simplified(
     // Link indices and properties
@@ -484,12 +651,38 @@ __device__ void gpu_findConduitFlow_simplified(
         y2 = gpu_MIN(y2, xsect->yFull);
     }
 
+    // DEBUG: Log clamped depths for link 1 (C2) at routing step 2, iter 0-1
+    if (j == 1 && steps <= 1) {
+        printf("GPU_CLAMPED_DEPTHS[link=%d step=%d]: y1=%.6f y2=%.6f (yFull=%.6f surchMethod=%d)\n",
+               j, steps, y1, y2, xsect->yFull, surchargeMethod);
+    }
+
     // Get area from previous time step
     aOld = a2_old;
     aOld = gpu_MAX(aOld, GPU_FUDGE);
 
     // Use Courant-modified length
     length = modLength;
+
+    // CRITICAL: Adjust flow depths based on flow regime (critical/normal depth)
+    // This mirrors CPU dwflow.c::findSurfArea() call at line 157
+    double surfArea1_computed, surfArea2_computed;
+    int flowClass_computed;
+    gpu_findSurfArea(
+        j, xsect, qLast, length,
+        offset1, offset2,
+        node1_type, node2_type,
+        node1_invertElev, node2_invertElev,
+        conduitBeta, conduitQmax,
+        surchargeMethod, crownCutoff,
+        &h1, &h2, &y1, &y2,
+        &surfArea1_computed, &surfArea2_computed, &flowClass_computed);
+
+    // DEBUG: Log depth adjustments for link 1 (C2) at step 2-3, iter 0-1
+    if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps <= 1) {
+        printf("GPU_AFTER_FINDSURF AREA[routingStep=%d iter=%d]: y1=%.6f y2=%.6f flowClass=%d\n",
+               g_routingStepCounter, steps, y1, y2, flowClass_computed);
+    }
 
     // Compute area at each end & hydraulic radius at upstream end
     wSlot = gpu_getSlotWidth(xsect, y1, surchargeMethod, crownCutoff);
@@ -504,6 +697,12 @@ __device__ void gpu_findConduitFlow_simplified(
     wSlot = gpu_getSlotWidth(xsect, yMid, surchargeMethod, crownCutoff);
     aMid = gpu_getArea(xsect, yMid, wSlot);
     rMid = gpu_getHydRad(xsect, yMid);
+
+    // DEBUG: Log hydraulic radii for link 1 (C2) at step 2-3, iter 0-1
+    if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps <= 1) {
+        printf("GPU_HYD_RAD[routingStep=%d iter=%d]: y1=%.6f→r1=%.6f, yMid=%.6f→rMid=%.6f\n",
+               g_routingStepCounter, steps, y1, r1, yMid, rMid);
+    }
 
     // Check if flowing full
     isFull = (y1 >= xsect->yFull && y2 >= xsect->yFull) ? 1 : 0;
@@ -525,6 +724,12 @@ __device__ void gpu_findConduitFlow_simplified(
     v = qLast / aMid;
     if (fabs(v) > GPU_MAXVELOCITY) {
         v = GPU_MAXVELOCITY * GPU_SGN(qLast);
+    }
+
+    // DEBUG: Log qLast and velocity for Link 1 (C2) at step 2-3, iter 0-1
+    if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps <= 1) {
+        printf("GPU_VELOCITY[routingStep=%d iter=%d]: qLast=%.6f aMid=%.6f → v=%.6f\n",
+               g_routingStepCounter, steps, qLast, aMid, v);
     }
 
     // Compute Froude number
@@ -585,6 +790,17 @@ __device__ void gpu_findConduitFlow_simplified(
     // Combine terms to find new conduit flow
     denom = 1.0 + dq1;  // Simplified: no local losses in Stage 1
     q = (qOld - dq2 + dq3 + dq4) / denom;
+
+    // DEBUG: Log momentum equation terms for Link 1 (C2) at step 2-3, iter 0-1
+    if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps <= 1) {
+        printf("GPU_MOMENTUM_EQN[routingStep=%d iter=%d]:\n", g_routingStepCounter, steps);
+        printf("  v=%.6f sigma=%.6f rho=%.6f\n", v, sigma, rho);
+        printf("  aWtd=%.6f rWtd=%.6f\n", aWtd, rWtd);
+        printf("  dq1(friction)=%.6f dq2(energy)=%.6f dq3(inertia1)=%.6f dq4(inertia2)=%.6f\n",
+               dq1, dq2, dq3, dq4);
+        printf("  denom=%.6f qOld=%.6f q_new=%.6f\n", denom, qOld, q);
+        printf("  h1=%.6f h2=%.6f dh=%.6f\n", h1, h2, h2 - h1);
+    }
 
     // Compute derivative of flow w.r.t. head
     *dqdh_out = 1.0 / denom * GPU_GRAVITY * dt * aWtd / length * barrels;

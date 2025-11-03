@@ -822,6 +822,27 @@ void updateNodeFlows(int i)
     }
     
     // --- add surf. area contributions to upstream/downstream nodes
+    // DEBUG: Log surface area contributions to node 1 (J2) during routing step 1
+    static int cpu_updateFlow_routingStep = 0;
+    static int cpu_updateFlow_lastSteps = -1;
+    if (Steps == 0 && cpu_updateFlow_lastSteps != 0) cpu_updateFlow_routingStep++;
+    cpu_updateFlow_lastSteps = Steps;
+
+    if ((Link[i].node1 == 1 || Link[i].node2 == 1) && cpu_updateFlow_routingStep == 1 && Steps == 0) {
+        printf("  CPU_SURF_CONTRIB: link%d(n1=%d n2=%d) surfArea1=%.6f surfArea2=%.6f barrels=%d\n",
+               i, Link[i].node1, Link[i].node2, Link[i].surfArea1, Link[i].surfArea2, barrels);
+        if (Link[i].node1 == 1) {
+            printf("    → node1=%d gets surfArea1*barrels = %.6f*%d = %.6f (before: %.6f after: %.6f)\n",
+                   Link[i].node1, Link[i].surfArea1, barrels, Link[i].surfArea1 * barrels,
+                   Xnode[Link[i].node1].newSurfArea, Xnode[Link[i].node1].newSurfArea + Link[i].surfArea1 * barrels);
+        }
+        if (Link[i].node2 == 1) {
+            printf("    → node2=%d gets surfArea2*barrels = %.6f*%d = %.6f (before: %.6f after: %.6f)\n",
+                   Link[i].node2, Link[i].surfArea2, barrels, Link[i].surfArea2 * barrels,
+                   Xnode[Link[i].node2].newSurfArea, Xnode[Link[i].node2].newSurfArea + Link[i].surfArea2 * barrels);
+        }
+    }
+
     Xnode[Link[i].node1].newSurfArea += Link[i].surfArea1 * barrels;
     Xnode[Link[i].node2].newSurfArea += Link[i].surfArea2 * barrels;
 
@@ -902,17 +923,17 @@ int findNodeDepths(double dt)
         {
             Xnode[i].converged = FALSE;
 
-            // DEBUG: Trace convergence failures for problem storage nodes (first 3 Picard iterations only)
-            #ifdef GPU_DEBUG_SURF
-            if ((i == 926 || i == 927 || i == 928) && Steps <= 3) {
+            // DEBUG: Log non-converging nodes for first 5 routing steps
+            static int cpuRoutingStepCount = 0;
+            if (cpuRoutingStepCount < 5 && Steps <= 8) {
                 double depthChange = fabs(yOld - Node[i].newDepth);
-                printf("CPU_CONVERGE_FAIL[step=%d node=%d]: depthChange=%.6f > headTol=%.6f (%.1fx)\n",
-                       Steps, i, depthChange, HeadTol, depthChange / HeadTol);
-                printf("  yOld=%.6f → newDepth=%.6f (Δ=%.6f ft)\n", yOld, Node[i].newDepth, depthChange);
-                printf("  nodeType=%d inflow=%.6f outflow=%.6f\n",
-                       Node[i].type, Node[i].inflow, Node[i].outflow);
+                printf("  CPU_NODE_FAIL[step=%d iter=%d node=%d type=%d]: depthChange=%.6f > tol=%.6f (%.1fx) depth: %.6f→%.6f in=%.3f out=%.3f\n",
+                       cpuRoutingStepCount, Steps, i, Node[i].type,
+                       depthChange, HeadTol, depthChange / HeadTol,
+                       yOld, Node[i].newDepth,
+                       Node[i].inflow, Node[i].outflow);
             }
-            #endif
+            if (Steps == 0) cpuRoutingStepCount++;  // Increment once per routing step
         }
     }
 }
@@ -980,6 +1001,21 @@ void setNodeDepth(int i, double dt)
     // --- determine average net flow volume into node over the time step
     dQ = Node[i].inflow - Node[i].outflow;
     dV = 0.5 * (Node[i].oldNetInflow + dQ) * dt;
+
+    // DEBUG: Comprehensive Node 1 (J2, index 1) input logging for routing steps 1-3, iterations 0-2
+    static int cpu_routingStepCounter = 0;
+    static int cpu_lastSteps = -1;
+    if (Steps == 0 && cpu_lastSteps != 0) cpu_routingStepCounter++;
+    cpu_lastSteps = Steps;
+    if (i == 1 && cpu_routingStepCounter >= 1 && cpu_routingStepCounter <= 3 && Steps <= 2) {
+        printf("CPU_NODE1_INPUTS[routingStep=%d iter=%d]:\n", cpu_routingStepCounter, Steps);
+        printf("  oldDepth=%.6f oldVolume=%.6f oldNetInflow=%.6f\n",
+               Node[i].oldDepth, Node[i].oldVolume, Node[i].oldNetInflow);
+        printf("  inflow=%.6f outflow=%.6f dQ=%.6f\n",
+               Node[i].inflow, Node[i].outflow, dQ);
+        printf("  dV=%.6f dt=%.6f surfArea=%.6f\n", dV, dt, surfArea);
+        printf("  newDepth_last=%.6f fullDepth=%.6f\n", yLast, Node[i].fullDepth);
+    }
 
     // --- determine if node is EXTRAN surcharged
     if (SurchargeMethod == EXTRAN)
@@ -1067,6 +1103,19 @@ void setNodeDepth(int i, double dt)
 
     // --- save new depth for node
     Node[i].newDepth = yNew;
+
+    // DEBUG: Track divergence for J2 (node index 1) during routing steps 0-3
+    static int cpu_diverge_routingStep = 0;
+    static int cpu_diverge_lastIter = -1;
+    if (Steps == 0 && cpu_diverge_lastIter != 0) cpu_diverge_routingStep++;
+    cpu_diverge_lastIter = Steps;
+    if (i == 1 && cpu_diverge_routingStep >= 0 && cpu_diverge_routingStep <= 3 && Steps <= 3) {
+        printf("CPU_DIVERGE[routeStep=%d iter=%d node=J2]: inflow=%.6f outflow=%.6f oldDepth=%.6f newDepth=%.6f oldVol=%.6f newVol=%.6f\n",
+               cpu_diverge_routingStep, Steps,
+               Node[i].inflow, Node[i].outflow,
+               Node[i].oldDepth, Node[i].newDepth,
+               Node[i].oldVolume, Node[i].newVolume);
+    }
 }
 
 //=============================================================================

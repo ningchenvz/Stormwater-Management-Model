@@ -135,9 +135,38 @@ void  dwflow_findConduitFlow(int j, int steps, double omega, double dt)
     // --- use Courant-modified length instead of conduit's actual length
     length = Conduit[k].modLength;
 
+    // DEBUG: Log Link 1 (C2: STOR1→J2) conduit flow inputs for step 2-3, iter 0-1
+    static int cpuRoutingStepCounter = 0;
+    static int lastSteps = -1;
+    if (steps == 0 && lastSteps != 0) cpuRoutingStepCounter++;  // Increment at start of each routing step
+    lastSteps = steps;
+    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
+        printf("CPU_CONDUIT_C2_IN[routingStep=%d iter=%d]:\n", cpuRoutingStepCounter, steps);
+        printf("  n1=%d(STOR1) depth=%.6f invert=%.6f\n", n1, y1, z1);
+        printf("  n2=%d(J2) depth=%.6f invert=%.6f\n", n2, y2, z2);
+        printf("  offsets: off1=%.6f off2=%.6f\n",
+               Link[j].offset1, Link[j].offset2);
+        printf("  xsect: type=%d yFull=%.6f aFull=%.6f rFull=%.6f rough=%.6f\n",
+               xsect->type, xsect->yFull, xsect->aFull, xsect->rFull, Conduit[k].roughness);
+        printf("  conduit: length=%.6f barrels=%d oldFlow=%.6f\n",
+               length, (int)barrels, qOld);
+    }
+
+    // DEBUG: Log y1, y2 BEFORE findSurfArea for Link 1 at step 2-3, iter 0-1
+    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
+        printf("CPU_BEFORE_FINDSURF AREA[routingStep=%d iter=%d]: y1=%.6f y2=%.6f (clamped to yFull=%.6f)\n",
+               cpuRoutingStepCounter, steps, y1, y2, xsect->yFull);
+    }
+
     // --- find surface area contributions to upstream and downstream nodes
     //     based on previous iteration's flow estimate
     findSurfArea(j, qLast, length, &h1, &h2, &y1, &y2);
+
+    // DEBUG: Log y1, y2 after findSurfArea for Link 1 at step 2-3, iter 0-1
+    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
+        printf("CPU_AFTER_FINDSURF AREA[routingStep=%d iter=%d]: y1=%.6f y2=%.6f flowClass=%d\n",
+               cpuRoutingStepCounter, steps, y1, y2, Link[j].flowClass);
+    }
 
     // --- compute area at each end of conduit & hyd. radius at upstream end
     wSlot = getSlotWidth(xsect, y1);
@@ -151,6 +180,12 @@ void  dwflow_findConduitFlow(int j, int steps, double omega, double dt)
     wSlot = getSlotWidth(xsect, yMid);
     aMid = getArea(xsect, yMid, wSlot);
     rMid = getHydRad(xsect, yMid);
+
+    // DEBUG: Log hydraulic radii for Link 1 at step 2-3, iter 0-1
+    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
+        printf("CPU_HYD_RAD[routingStep=%d iter=%d]: y1=%.6f→r1=%.6f, yMid=%.6f→rMid=%.6f\n",
+               cpuRoutingStepCounter, steps, y1, r1, yMid, rMid);
+    }
 
     // --- alternate approach not currently used, but might produce better
     //     Bernoulli energy balance for steady flows
@@ -182,6 +217,12 @@ void  dwflow_findConduitFlow(int j, int steps, double omega, double dt)
     // --- compute velocity from last flow estimate
     v = qLast / aMid;
     if ( fabs(v) > MAXVELOCITY )  v = MAXVELOCITY * SGN(qLast);
+
+    // DEBUG: Log qLast and velocity for Link 1 (C2) at step 2-3, iter 0-1
+    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
+        printf("CPU_VELOCITY[routingStep=%d iter=%d]: qLast=%.6f aMid=%.6f → v=%.6f\n",
+               cpuRoutingStepCounter, steps, qLast, aMid, v);
+    }
 
     // --- compute Froude No.
     Link[j].froude = link_getFroude(j, v, yMid);
@@ -238,6 +279,26 @@ void  dwflow_findConduitFlow(int j, int steps, double omega, double dt)
     // --- combine terms to find new conduit flow
     denom = 1.0 + dq1 + dq5;
     q = (qOld - dq2 + dq3 + dq4 + dq6) / denom;
+
+    // DEBUG: Log momentum equation terms for Link 1 (C2) at step 2-3, iter 0-1
+    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
+        printf("CPU_MOMENTUM_EQN[routingStep=%d iter=%d]:\n", cpuRoutingStepCounter, steps);
+        printf("  v=%.6f sigma=%.6f rho=%.6f\n", v, sigma, rho);
+        printf("  aWtd=%.6f rWtd=%.6f\n", aWtd, rWtd);
+        printf("  dq1(friction)=%.6f dq2(energy)=%.6f dq3(inertia1)=%.6f dq4(inertia2)=%.6f dq5(losses)=%.6f dq6(evap)=%.6f\n",
+               dq1, dq2, dq3, dq4, dq5, dq6);
+        printf("  denom=%.6f qOld=%.6f q_new=%.6f\n", denom, qOld, q);
+        printf("  h1=%.6f h2=%.6f dh=%.6f\n", h1, h2, h2 - h1);
+    }
+
+    // DEBUG: Log Link 1 (C2) conduit flow outputs for step 2-3, iter 0-1
+    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
+        printf("CPU_CONDUIT_C2_OUT[routingStep=%d iter=%d]:\n", cpuRoutingStepCounter, steps);
+        printf("  q=%.6f qTotal=%.6f (barrels=%d)\n", q, q * barrels, (int)barrels);
+        printf("  aMid=%.6f yMid=%.6f dqdh=%.6f froude=%.6f\n",
+               aMid, yMid, 1.0 / denom  * GRAVITY * dt * aWtd / length * barrels, Link[j].froude);
+        printf("  after findSurfArea: y1=%.6f y2=%.6f\n", y1, y2);
+    }
 
     // --- compute derivative of flow w.r.t. head
     Link[j].dqdh = 1.0 / denom  * GRAVITY * dt * aWtd / length * barrels;
@@ -472,6 +533,16 @@ void findSurfArea(int j, double q, double length, double* h1, double* h2,
         widthMid = getWidth(xsect, flowDepthMid);
         surfArea1 = (width1 + widthMid) * length / 4.;
         surfArea2 = (widthMid + width2) * length / 4. * fasnh;
+
+        // DEBUG: Log width calculations for Link 1 on first call only
+        static int cpu_surf_callCount = 0;
+        cpu_surf_callCount++;
+        if (j == 1 && cpu_surf_callCount == 1) {
+            printf("  CPU_FINDSURF link%d SUBCRITICAL: flowDepth1=%.6f flowDepth2=%.6f flowDepthMid=%.6f\n",
+                   j, flowDepth1, flowDepth2, flowDepthMid);
+            printf("    width1=%.6f widthMid=%.6f length=%.3f\n", width1, widthMid, length);
+            printf("    surfArea1=(%.6f + %.6f)*%.3f/4 = %.6f\n", width1, widthMid, length, surfArea1);
+        }
         break;
 
       case UP_CRITICAL:

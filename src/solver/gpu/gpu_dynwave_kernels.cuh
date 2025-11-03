@@ -20,6 +20,11 @@
 #include "gpu_table_helpers.cuh"
 
 //-----------------------------------------------------------------------------
+// External device variables
+//-----------------------------------------------------------------------------
+extern __device__ int g_depthRoutingStepCounter;
+
+//-----------------------------------------------------------------------------
 // Constants (from dynwave.c)
 //-----------------------------------------------------------------------------
 #define GPU_OMEGA               0.5     // under-relaxation parameter
@@ -376,15 +381,14 @@ __device__ void gpu_setNodeDepth(
     surfArea = newSurfArea;
     surfArea = gpu_MAX(surfArea, minSurfArea);
 
-    // DEBUG: Trace J1 (node 0) depth calculation (first 3 iterations only)
-    if (i == 0 && steps <= 3 && nodeType == GPU_JUNCTION) {
-        printf("J1_DEPTH[step=%d]: fullDepth=%.3f surDepth=%.3f pondedArea=%.3f\n",
-               steps, fullDepth, surDepth, pondedArea);
-        printf("  newSurfArea=%.3f minSurfArea=%.3f surfArea(used)=%.3f\n",
-               newSurfArea, minSurfArea, surfArea);
-        printf("  inflow=%.6f outflow=%.6f oldNetInflow=%.6f\n",
-               inflow, outflow, oldNetInflow);
-        printf("  yOld=%.6f yLast=%.6f dt=%.3f\n", yOld, yLast, dt);
+    // DEBUG: Trace Node 1 (J2) for routing steps 1-3, all iterations
+    // This is the problematic node that's not converging
+    if (i == 1 && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 3) {
+        const char* typeStr = (nodeType == GPU_JUNCTION) ? "JUNC" : (nodeType == GPU_STORAGE) ? "STOR" : "OTHR";
+        printf("NODE%d_%s[routingStep=%d iter=%d]: yOld=%.6f yLast=%.6f\n",
+               i, typeStr, g_depthRoutingStepCounter, steps, yOld, yLast);
+        printf("  inflow=%.6f outflow=%.6f oldNetInflow=%.6f dt=%.3f surfArea=%.3f newSurfArea=%.6f minSurfArea=%.6f\n",
+               inflow, outflow, oldNetInflow, dt, surfArea, newSurfArea, minSurfArea);
     }
 
     // DEBUG: Trace STOR-10 (node 926) surface area accumulation (first 3 routing steps)
@@ -407,9 +411,13 @@ __device__ void gpu_setNodeDepth(
     dQ = inflow - outflow;
     dV = 0.5 * (oldNetInflow + dQ) * dt;
 
-    // DEBUG: Trace J1 flow calculation
-    if (i == 0 && steps <= 3 && nodeType == GPU_JUNCTION) {
-        printf("  dQ=%.6f dV=%.6f dy=%.6f\n", dQ, dV, dV/surfArea);
+    // DEBUG: Comprehensive Node 1 (J2) input logging for routing steps 1-3, iterations 0-2
+    if (i == 1 && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 3 && steps <= 2) {
+        printf("GPU_NODE1_INPUTS[routingStep=%d iter=%d]:\n", g_depthRoutingStepCounter, steps);
+        printf("  oldDepth=%.6f oldVolume=%.6f oldNetInflow=%.6f\n", yOld, oldVolume, oldNetInflow);
+        printf("  inflow=%.6f outflow=%.6f dQ=%.6f\n", inflow, outflow, dQ);
+        printf("  dV=%.6f dt=%.6f surfArea=%.6f\n", dV, dt, surfArea);
+        printf("  newDepth_last=%.6f fullDepth=%.6f\n", yLast, fullDepth);
     }
 
     // --- determine if node is EXTRAN surcharged

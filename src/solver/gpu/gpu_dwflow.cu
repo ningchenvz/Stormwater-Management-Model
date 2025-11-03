@@ -50,6 +50,18 @@ typedef struct {
 
 __device__ GPUPumpDebugEntry g_gpuPumpDebugEntries[64 * GPU_PUMP_DEBUG_MAX];
 
+// DEBUG: Track routing step for inflow instrumentation
+__device__ int g_routingStepCounter = 0;
+__device__ int g_accumRoutingStepCounter = 0;
+__device__ int g_gpu_surf_logged = 0;
+
+// Helper kernel to increment routing step counter
+__global__ void kernel_incrementRoutingStepCounter() {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        g_routingStepCounter++;
+    }
+}
+
 extern "C" {
 #include "headers.h"
 #include "dynwave_data.h"
@@ -375,7 +387,7 @@ static void copyNodesToGpu(GPU_NodeData* gpuNodes)
     copyIteration++;
 }
 
-static void copyNodesFromGpu(GPU_NodeData* gpuNodes)
+static void copyNodesFromGpu(GPU_NodeData* gpuNodes, int copyDepthAndVolume)
 {
     int count = gpuNodes->count;
     for (int i = 0; i < count; i++)
@@ -386,9 +398,12 @@ static void copyNodesFromGpu(GPU_NodeData* gpuNodes)
         Xnode[i].newSurfArea = gpuNodes->h_newSurfArea[i];
         Xnode[i].sumdqdh     = gpuNodes->h_sumdqdh[i];
 
-        // CRITICAL: Also transfer newDepth and newVolume for CPU non-conduits (pumps need these!)
-        Node[i].newDepth = gpuNodes->h_newDepth[i];
-        Node[i].newVolume = gpuNodes->h_newVolume[i];
+        // CRITICAL: Only copy newDepth/newVolume at END of Picard loop (final converged values)
+        // Do NOT copy during intermediate iterations - it corrupts the depth state for next routing step!
+        if (copyDepthAndVolume) {
+            Node[i].newDepth = gpuNodes->h_newDepth[i];
+            Node[i].newVolume = gpuNodes->h_newVolume[i];
+        }
     }
 }
 
@@ -475,6 +490,7 @@ __global__ void kernel_findConduitFlows(
     GPU_ConduitData* conduits,
     GPU_XsectData* xsects,
     GPU_NodeData* nodes,
+    GPU_LinkContribution* contributions,
     double dt,
     int steps,
     double omega,
@@ -562,6 +578,21 @@ __global__ void kernel_findConduitFlows(
     double surfArea1, surfArea2;
     int flowClass;
 
+    // DEBUG: Log Link 1 (C2: STOR1→J2) conduit flow inputs for step 2-3, iter 0-1
+    if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps >= 0 && steps <= 1) {
+        printf("GPU_CONDUIT_C2_IN[routingStep=%d iter=%d]:\n", g_routingStepCounter, steps);
+        printf("  n1=%d(STOR1) depth=%.6f invert=%.6f\n",
+               n1, nodes->d_newDepth[n1], nodes->d_invertElev[n1]);
+        printf("  n2=%d(J2) depth=%.6f invert=%.6f\n",
+               n2, nodes->d_newDepth[n2], nodes->d_invertElev[n2]);
+        printf("  offsets: off1=%.6f off2=%.6f\n",
+               links->d_offset1[j], links->d_offset2[j]);
+        printf("  xsect: type=%d yFull=%.6f aFull=%.6f rFull=%.6f rough=%.6f\n",
+               xsect.type, xsect.yFull, xsect.aFull, xsect.rFull, conduits->d_roughFactor[k]);
+        printf("  conduit: length=%.6f barrels=%d oldFlow=%.6f\n",
+               conduits->d_modLength[k], conduits->d_barrels[k], links->d_oldFlow[j]);
+    }
+
     gpu_findConduitFlow_simplified(
         j, k, n1, n2,
         &xsect,
@@ -601,8 +632,25 @@ __global__ void kernel_findConduitFlows(
         &surfArea2,
         &flowClass);
 
+    // DEBUG: Log Link 1 (C2) conduit flow outputs for step 2-3, iter 0-1
+    if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps >= 0 && steps <= 1) {
+        printf("GPU_CONDUIT_C2_OUT[routingStep=%d iter=%d]:\n", g_routingStepCounter, steps);
+        printf("  q=%.6f qTotal=%.6f (barrels=%d)\n",
+               q, q * (double)conduits->d_barrels[k], conduits->d_barrels[k]);
+        printf("  aMid=%.6f yMid=%.6f dqdh=%.6f froude=%.6f flowClass=%d\n",
+               aMid, yMid, dqdh, froude, flowClass);
+        printf("  surfArea1=%.6f surfArea2=%.6f\n", surfArea1, surfArea2);
+    }
+
     // Save results
     double barrels = (double)conduits->d_barrels[k];
+
+    // DEBUG: Log d_q1 update for Link 1 (C2) at step 2-3, iter 0-1
+    if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps <= 1) {
+        printf("GPU_Q1_UPDATE[routingStep=%d iter=%d]: Link %d Conduit %d: d_q1[%d] %.6f → %.6f\n",
+               g_routingStepCounter, steps, j, k, k, conduits->d_q1[k], q);
+    }
+
     conduits->d_q1[k] = q;
     conduits->d_q2[k] = q;
     conduits->d_a1[k] = aMid;
@@ -624,18 +672,38 @@ __global__ void kernel_findConduitFlows(
     links->d_surfArea2[j] = surfArea2;
     links->d_flowClass[j] = (signed char)flowClass;
 
-    // Accumulate node-level terms
-    atomicAdd(&nodes->d_newSurfArea[n1], surfArea1 * barrels);
-    atomicAdd(&nodes->d_newSurfArea[n2], surfArea2 * barrels);
-    atomicAdd(&nodes->d_sumdqdh[n1], dqdh);
-    atomicAdd(&nodes->d_sumdqdh[n2], dqdh);
+    // STAGE 1: Write contributions to link-specific slot (NO atomics, deterministic)
+    // These will be accumulated in CPU-matching order by kernel_accumulateNodeContributions
+    GPU_LinkContribution* contrib = &contributions[j];
 
+    // Node 1 (upstream) contributions
+    contrib->node1_surfArea = surfArea1 * barrels;
+    contrib->node1_sumdqdh = dqdh;
     if (qTotal >= 0.0) {
-        atomicAdd(&nodes->d_outflow[n1], qTotal);
-        atomicAdd(&nodes->d_inflow[n2], qTotal);
+        contrib->node1_inflow = 0.0;
+        contrib->node1_outflow = qTotal;
     } else {
-        atomicAdd(&nodes->d_inflow[n1], -qTotal);
-        atomicAdd(&nodes->d_outflow[n2], -qTotal);
+        contrib->node1_inflow = -qTotal;
+        contrib->node1_outflow = 0.0;
+    }
+
+    // Node 2 (downstream) contributions
+    contrib->node2_surfArea = surfArea2 * barrels;
+    contrib->node2_sumdqdh = dqdh;
+    if (qTotal >= 0.0) {
+        contrib->node2_inflow = qTotal;
+        contrib->node2_outflow = 0.0;
+    } else {
+        contrib->node2_inflow = 0.0;
+        contrib->node2_outflow = -qTotal;
+    }
+
+    // DEBUG: Log contributions for Node 1 (index 1) during Steps 2-4, Iter 1-2
+    if (g_routingStepCounter >= 2 && g_routingStepCounter <= 4 && steps >= 1 && steps <= 2) {
+        if (n1 == 1 || n2 == 1) {
+            printf("  GPU_FLOW_CONTRIB[step=%d iter=%d link=%d]: q=%.6f n1=%d n2=%d surfA1=%.6f surfA2=%.6f\n",
+                   g_routingStepCounter, steps, j, qTotal, n1, n2, surfArea1 * barrels, surfArea2 * barrels);
+        }
     }
 
 }
@@ -1593,6 +1661,7 @@ int launchLinkFlowKernels(
     GPU_OutletData* d_gpuOutlets,
     GPU_CurveData* d_gpuCurves,
     GPU_CurvePoints* d_gpuCurvePoints,
+    GPU_LinkContribution* d_contributions,
     double dt,
     int steps,
     double omega,
@@ -1623,9 +1692,10 @@ int launchLinkFlowKernels(
     }
     launchCount++;
 
-    // Launch conduit flow kernel
+    // Launch conduit flow kernel (STAGE 1: write contributions, no atomics)
     kernel_findConduitFlows<<<gridSize, blockSize, 0, stream>>>(
         d_links, d_conduits, d_xsects, d_nodes,
+        d_contributions,  // Parameter from function signature
         dt, steps, omega,
         surchargeMethod, crownCutoff, inertDamping);
 
@@ -1758,6 +1828,7 @@ int gpu_computeConduitFlows(
     GPU_ConduitData* conduits_unused,
     GPU_XsectData* xsects_unused,
     GPU_NodeData* nodes_unused,
+    GPU_LinkContribution* d_contributions,
     double dt,
     int steps,
     double omega,
@@ -1767,6 +1838,7 @@ int gpu_computeConduitFlows(
 //
 //  Purpose: Copies SWMM link/conduit state to GPU, runs the conduit flow kernel,
 //           and copies results back. Returns 0 on success or -1 on failure.
+//  Note: This is a legacy function - main path uses launchLinkFlowKernels
 //
 {
     extern TNode* Node;
@@ -1846,9 +1918,10 @@ int gpu_computeConduitFlows(
         return -1;
     }
 
-    // Launch conduit flow kernel
+    // Launch conduit flow kernel (STAGE 1: write contributions, no atomics)
     kernel_findConduitFlows<<<gridSize, blockSize, 0, stream>>>(
         d_links, d_conduits, d_xsects, d_nodes,
+        d_contributions,  // Parameter from function signature
         dt, steps, omega,
         surchargeMethod, crownCutoff, inertDamping);
 
@@ -1927,7 +2000,7 @@ int gpu_computeConduitFlows(
 
     // Copy results back to CPU (only dynamic data the CPU needs immediately)
     copyLinkIterStateFromGpu(links);
-    copyNodesFromGpu(nodes);  // Node inflow/outflow updated by kernel
+    copyNodesFromGpu(nodes, 0);  // Copy inflow/outflow only, NOT depth/volume (prevents corruption)
     g_conduitKernelCtx.resultsDirty = 1;
 
     // --- DEBUG: Log link flow and node flow discrepancies for first few iterations

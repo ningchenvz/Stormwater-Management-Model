@@ -202,6 +202,40 @@ typedef struct {
 } GPU_LinkData;
 
 //-----------------------------------------------------------------------------
+// GPU Link Contributions (for deterministic node accumulation)
+//-----------------------------------------------------------------------------
+// Two-stage accumulation to eliminate non-deterministic atomicAdd ordering:
+//   Stage 1: Each link writes contributions to its own slot (no atomics)
+//   Stage 2: Dedicated kernel sums contributions in CPU-matching order
+//
+// This ensures bit-identical floating-point summation order as CPU's serial loop
+//
+typedef struct {
+    // Contributions from this link to node1 (upstream)
+    double node1_inflow;        // Flow entering node1 (cfs)
+    double node1_outflow;       // Flow leaving node1 (cfs)
+    double node1_surfArea;      // Surface area at node1 (ft2)
+    double node1_sumdqdh;       // dqdh contribution at node1 (ft2/sec)
+
+    // Contributions from this link to node2 (downstream)
+    double node2_inflow;        // Flow entering node2 (cfs)
+    double node2_outflow;       // Flow leaving node2 (cfs)
+    double node2_surfArea;      // Surface area at node2 (ft2)
+    double node2_sumdqdh;       // dqdh contribution at node2 (ft2/sec)
+} GPU_LinkContribution;
+
+//-----------------------------------------------------------------------------
+// GPU Link Contributions Array
+//-----------------------------------------------------------------------------
+// One contribution per link (indexed by link global index)
+//
+typedef struct {
+    int count;                          // Number of links (total)
+    GPU_LinkContribution* h_contributions;  // Host array (pinned)
+    GPU_LinkContribution* d_contributions;  // Device array
+} GPU_LinkContributions;
+
+//-----------------------------------------------------------------------------
 // GPU Conduit Data (Structure of Arrays)
 //-----------------------------------------------------------------------------
 // Contains conduit-specific data for dynamic wave routing
