@@ -197,9 +197,11 @@ void dynwave_init()
     else                           CrownCutoff = EXTRAN_CROWN_CUTOFF;
 
 #ifdef BUILD_GPU
-    // --- initialize GPU data for non-conduit links if GPU is enabled
+    // --- initialize GPU data for non-conduit links and curves if GPU is enabled
+    // NOTE: Curves are needed for TABULAR storage nodes, so initialize even if no non-conduit links
     if (g_gpuConfig.useCuda && (Nlinks[PUMP] > 0 || Nlinks[ORIFICE] > 0 ||
-                                 Nlinks[WEIR] > 0 || Nlinks[OUTLET] > 0))
+                                 Nlinks[WEIR] > 0 || Nlinks[OUTLET] > 0 ||
+                                 Nobjects[CURVE] > 0))
     {
         if (gpu_initializeNonConduitData() != 0) {
             printf("\n  WARNING: Failed to initialize GPU non-conduit data, disabling GPU\n");
@@ -265,6 +267,24 @@ double dynwave_getRoutingStep(double fixedStep)
 
     // --- otherwise compute variable step based on current flow solution
     else VariableStep = getVariableStep(fixedStep);
+
+    // FAST PATCH DISABLED: Testing if proper fix (deferred timestep calculation) is sufficient
+    // The proper fix moves getRoutingStep() to AFTER routing_execute() completes
+    // TODO: Re-enable if proper fix alone doesn't prevent 30s+pump explosion
+#if 0
+    static int routingStepCounter = 0;
+    if (g_gpuConfig.useCuda && routingStepCounter < 5) {
+        double maxEarlyStep = 1.0;  // Cap at 1 second for first 5 steps
+        if (VariableStep > maxEarlyStep) {
+            if (routingStepCounter < 3) {
+                printf("  PATCH: Capping step %d from %.3f to %.3f sec (GPU cold-start protection)\n",
+                       routingStepCounter, VariableStep, maxEarlyStep);
+            }
+            VariableStep = maxEarlyStep;
+        }
+    }
+    routingStepCounter++;
+#endif
 
     // --- adjust step to be a multiple of a millisecond
     VariableStep = floor(1000.0 * VariableStep) / 1000.0;
@@ -371,7 +391,27 @@ gpu_path_complete:
 #endif
 
 #ifdef BUILD_GPU
-    if (g_gpuConfig.useCuda) gpu_flushConduitResults();
+    if (g_gpuConfig.useCuda) {
+        gpu_flushConduitResults();
+
+        // DEBUG: Log link flows after GPU flush (first 10 routing steps)
+        static int flushDebugCount = 0;
+        if (flushDebugCount < 10) {
+            // Check a few key links for non-zero flows
+            int nonZeroCount = 0;
+            for (int i = 0; i < MIN(Nobjects[LINK], 100); i++) {
+                if (fabs(Link[i].newFlow) > 0.01) nonZeroCount++;
+            }
+            printf("  gpu_flushConduitResults[step=%d]: %d/%d links have non-zero flow\n",
+                   flushDebugCount, nonZeroCount, MIN(Nobjects[LINK], 100));
+            // Log specific link for Session18
+            if (Nobjects[LINK] > 895) {
+                printf("    Link 895: newFlow=%.3f froude=%.3f newVolume=%.3f\n",
+                       Link[895].newFlow, Link[895].froude, Link[895].newVolume);
+            }
+        }
+        flushDebugCount++;
+    }
 #endif
 
     //  --- identify any capacity-limited conduits
@@ -861,6 +901,18 @@ int findNodeDepths(double dt)
         if ( fabs(yOld - Node[i].newDepth) > HeadTol )
         {
             Xnode[i].converged = FALSE;
+
+            // DEBUG: Trace convergence failures for problem storage nodes (first 3 Picard iterations only)
+            #ifdef GPU_DEBUG_SURF
+            if ((i == 926 || i == 927 || i == 928) && Steps <= 3) {
+                double depthChange = fabs(yOld - Node[i].newDepth);
+                printf("CPU_CONVERGE_FAIL[step=%d node=%d]: depthChange=%.6f > headTol=%.6f (%.1fx)\n",
+                       Steps, i, depthChange, HeadTol, depthChange / HeadTol);
+                printf("  yOld=%.6f → newDepth=%.6f (Δ=%.6f ft)\n", yOld, Node[i].newDepth, depthChange);
+                printf("  nodeType=%d inflow=%.6f outflow=%.6f\n",
+                       Node[i].type, Node[i].inflow, Node[i].outflow);
+            }
+            #endif
         }
     }
 }
@@ -911,6 +963,19 @@ void setNodeDepth(int i, double dt)
     Node[i].overflow = 0.0;
     surfArea = Xnode[i].newSurfArea;
     surfArea = MAX(surfArea, MinSurfArea);
+
+    // DEBUG: Trace STOR-10 (node 926) surface area accumulation (first 3 routing steps)
+    #ifdef GPU_DEBUG_SURF
+    static int cpu_depth_steps = 0;
+    if (i == 926 && Steps <= 3 && Node[i].type == STORAGE) {
+        printf("CPU_STOR10_DEPTH[step=%d]: newSurfArea(conduits)=%.3f minSurfArea=%.3f surfArea(used)=%.3f\n",
+               Steps, Xnode[i].newSurfArea, MinSurfArea, surfArea);
+        printf("  inflow=%.6f outflow=%.6f dQ=%.6f oldNet=%.6f\n",
+               Node[i].inflow, Node[i].outflow, Node[i].inflow - Node[i].outflow, Node[i].oldNetInflow);
+        printf("  yOld=%.6f yLast=%.6f fullDepth=%.3f dt=%.6f\n",
+               yOld, yLast, Node[i].fullDepth, dt);
+    }
+    #endif
 
     // --- determine average net flow volume into node over the time step
     dQ = Node[i].inflow - Node[i].outflow;
@@ -1062,6 +1127,24 @@ double getVariableStep(double maxStep)
     double tMinLink;                    // allowable time step for links (sec)
     double tMinNode;                    // allowable time step for nodes (sec)
 
+    // DEBUG: Log entry to getVariableStep (first 10 calls when using GPU)
+    static int getVarStepCount = 0;
+    if (g_gpuConfig.useCuda && getVarStepCount < 10) {
+        printf("  getVariableStep[call=%d]: maxStep=%.6f\n", getVarStepCount, maxStep);
+        // Sample a few links to see what data we're working with
+        int sampleCount = 0;
+        for (int i = 0; i < MIN(Nobjects[LINK], 100); i++) {
+            if (Link[i].type == CONDUIT && fabs(Link[i].newFlow) > 0.01) {
+                sampleCount++;
+                if (sampleCount <= 3) {
+                    printf("    Link %d: newFlow=%.3f froude=%.3f\n", i, Link[i].newFlow, Link[i].froude);
+                }
+            }
+        }
+        printf("    Total links with flow > 0.01: %d\n", sampleCount);
+    }
+    getVarStepCount++;
+
     // --- find stable time step for links & then nodes
     tMin = maxStep;
     tMinLink = getLinkStep(tMin, &minLink);
@@ -1073,6 +1156,13 @@ double getVariableStep(double maxStep)
     {
         tMin = tMinNode ;
         minLink = -1;
+    }
+
+    // DEBUG: Log computed timesteps (AFTER selection)
+    if (g_gpuConfig.useCuda && getVarStepCount < 10) {
+        printf("    getLinkStep returned: tMinLink=%.6f (minLink=%d)\n", tMinLink, minLink);
+        printf("    getNodeStep returned: tMinNode=%.6f (minNode=%d)\n", tMinNode, minNode);
+        printf("    Selected tMin=%.6f (before MinRouteStep check)\n", tMin);
     }
 
     // --- update count of times the minimum node or link was critical

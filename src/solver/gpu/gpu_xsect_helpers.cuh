@@ -65,7 +65,10 @@ typedef struct {
     double  yFull;          // Full depth (ft)
     double  aFull;          // Full area (ft2)
     double  rFull;          // Full hydraulic radius (ft)
+    double  pFull;          // Full wetted perimeter (ft)
     double  wMax;           // Maximum width (ft)
+    double  sBot;           // Bottom slope / side slope (for triangular, trapezoidal)
+    double  rBot;           // Bottom radius (for parabolic)
     // Additional parameters for specific shapes
     double  geom1;          // Shape parameter 1 (width, diameter, etc.)
     double  geom2;          // Shape parameter 2 (height, side slope, etc.)

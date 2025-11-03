@@ -133,6 +133,7 @@ static int    ExceptionCount;       // number of exceptions handled
 static int    DoRunoff;             // TRUE if runoff is computed
 static int    DoRouting;            // TRUE if flow routing is computed
 static double RoutingDuration;      // duration of a set of routing steps (msecs)
+static double NextRoutingStep = 0.0;  // next routing step computed after current step completes
 
 #ifdef BUILD_GPU
 static int    GpuInitAttempted = 0;    // ensures cuda init only happens once
@@ -374,6 +375,7 @@ int DLLEXPORT swmm_start(int saveResults)
         ReportStepCount = 0;
         NonConvergeCount = 0;
         IsStartedFlag = TRUE;
+        NextRoutingStep = 0.0;  // reset deferred routing step calculation
 
         // --- initialize global continuity errors
         RunoffError = 0.0;
@@ -550,10 +552,20 @@ void execRouting()
     __try
 #endif
     {
-        // --- determine when next routing time occurs
+        // --- determine routing time step for THIS step
+        //     On first call (NextRoutingStep==0), compute it normally
+        //     On subsequent calls, use the pre-computed value from previous step
         TotalStepCount++;
-        if ( !DoRouting ) routingStep = MIN(WetStep, ReportStep);
-        else routingStep = routing_getRoutingStep(RouteModel, RouteStep);
+        if ( NextRoutingStep > 0.0 )
+        {
+            routingStep = NextRoutingStep;
+        }
+        else
+        {
+            if ( !DoRouting ) routingStep = MIN(WetStep, ReportStep);
+            else routingStep = routing_getRoutingStep(RouteModel, RouteStep);
+        }
+
         if ( routingStep <= 0.0 )
         {
             ErrorCode = ERR_TIMESTEP;
@@ -578,13 +590,24 @@ void execRouting()
 
         // --- if no runoff analysis, update climate state (for evaporation)
         else climate_setState(getDateTime(NewRoutingTime));
-  
+
         // --- route flows & pollutants through drainage system
         //     (while updating NewRoutingTime)
         if ( DoRouting )
             routing_execute(RouteModel, routingStep);
         else
             NewRoutingTime = nextRoutingTime;
+
+        // --- NOW compute the NEXT routing step after current step completed
+        //     This ensures GPU results are flushed before adaptive timestep calculation
+        if ( DoRouting && nextRoutingTime < RoutingDuration )
+        {
+            NextRoutingStep = routing_getRoutingStep(RouteModel, RouteStep);
+        }
+        else
+        {
+            NextRoutingStep = 0.0;
+        }
     }
 
 #ifdef EXH

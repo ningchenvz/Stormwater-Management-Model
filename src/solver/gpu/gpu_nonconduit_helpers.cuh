@@ -497,6 +497,14 @@ double gpu_node_getMaxOutflow(
     double qMax;
     double qOrig = q;
 
+#ifdef GPU_DEBUG_SURF
+    // DEBUG: Always log for node 926 (STOR-10)
+    if (j == 926) {
+        printf("  gpu_node_getMaxOutflow[node=%d]: q_in=%.6f fullVol=%.6f inflow=%.6f oldVol=%.6f tStep=%.6f\n",
+               j, q, d_nodeFullVolume[j], d_nodeInflow[j], d_nodeOldVolume[j], tStep);
+    }
+#endif
+
     // If node has storage volume, limit outflow
     if (d_nodeFullVolume[j] > 0.0) {
         // NEW APPROACH: Phase 1b no longer adds pump flows to d_nodeOutflow
@@ -504,11 +512,29 @@ double gpu_node_getMaxOutflow(
         // We can use the same formula as CPU without any adjustments!
         qMax = d_nodeInflow[j] + d_nodeOldVolume[j] / tStep;
 
+#ifdef GPU_DEBUG_SURF
+        if (j == 926) {
+            printf("  gpu_node_getMaxOutflow[node=%d]: qMax=%.6f (inflow %.6f + oldVol %.6f / tStep %.6f)\n",
+                   j, qMax, d_nodeInflow[j], d_nodeOldVolume[j], tStep);
+        }
+#endif
+
         if (q > qMax) {
             q = qMax;
+#ifdef GPU_DEBUG_SURF
+            printf("  *** PUMP FLOW LIMITED *** node=%d: %.6f → %.6f (qMax=%.6f)\n",
+                   j, qOrig, q, qMax);
+#else
             printf("  getMaxOutflow: node=%d limited q from %.6f to %.6f (qMax=%.6f, inflow=%.6f, oldVol=%.6f, tStep=%.6f)\n",
                    j, qOrig, q, qMax, d_nodeInflow[j], d_nodeOldVolume[j], tStep);
+#endif
         }
+#ifdef GPU_DEBUG_SURF
+        else if (j == 926) {
+            printf("  gpu_node_getMaxOutflow[node=%d]: NO LIMIT needed (q %.6f <= qMax %.6f)\n",
+                   j, q, qMax);
+        }
+#endif
     }
 
     return fmax(0.0, q);
@@ -542,21 +568,27 @@ double gpu_getModPumpFlow(
     const double* d_nodeFullVolume,
     const double* d_nodeSurfArea)
 {
-    // DEBUG: Entry logging for first few pumps
-    if (pumpIdx < 3) {
-        printf("getModPumpFlow pump=%d type=%d q=%.6f qPrelim=%.6f\n",
-               pumpIdx, pumpType, q, qPrelim);
+#ifdef GPU_DEBUG_SURF
+    // DEBUG: Log all calls for pumps feeding node 926 (STOR-10)
+    if (j == 926) {
+        printf("gpu_getModPumpFlow[pump=%d node=%d]: type=%d q=%.6f qPrelim=%.6f nodeType=%d\n",
+               pumpIdx, j, pumpType, q, qPrelim, d_nodeType[j]);
     }
+#endif
 
     if (q == 0.0) {
-        if (pumpIdx < 3) printf("  --> q=0, returning 0\n");
+#ifdef GPU_DEBUG_SURF
+        if (j == 926) printf("  --> q=0, returning 0\n");
+#endif
         return q;
     }
 
     // Case 1: Inlet node is a storage node
     // Prevent node volume from going negative
     if (d_nodeType[j] == STORAGE) {
-        if (pumpIdx < 3) printf("  --> Storage node, calling getMaxOutflow\n");
+#ifdef GPU_DEBUG_SURF
+        if (j == 926) printf("  --> Storage node %d, calling gpu_node_getMaxOutflow\n", j);
+#endif
         return gpu_node_getMaxOutflow(j, q, qPrelim, dt, d_nodeInflow, d_nodeOutflow,
                                      d_nodeOldVolume, d_nodeFullVolume);
     }

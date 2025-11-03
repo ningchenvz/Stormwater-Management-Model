@@ -387,6 +387,22 @@ __device__ void gpu_setNodeDepth(
         printf("  yOld=%.6f yLast=%.6f dt=%.3f\n", yOld, yLast, dt);
     }
 
+    // DEBUG: Trace STOR-10 (node 926) surface area accumulation (first 3 routing steps)
+    #ifdef GPU_DEBUG_SURF
+    if (i == 926 && steps <= 3 && nodeType == GPU_STORAGE) {
+        printf("STOR10_DEPTH[step=%d]: newSurfArea(conduits)=%.3f minSurfArea=%.3f surfArea(used)=%.3f\n",
+               steps, newSurfArea, minSurfArea, surfArea);
+        printf("  inflow=%.6f outflow=%.6f dQ=%.6f oldNet=%.6f\n",
+               inflow, outflow, inflow - outflow, oldNetInflow);
+        printf("  oldVol=%.3f yOld=%.6f yLast=%.6f fullDepth=%.3f dt=%.6f\n",
+               oldVolume, yOld, yLast, fullDepth, dt);
+        printf("  dV_calc=(0.5*(%.6f + %.6f)*%.6f)=%.6f → dy=%.6f\n",
+               oldNetInflow, inflow - outflow, dt,
+               0.5 * (oldNetInflow + (inflow - outflow)) * dt,
+               0.5 * (oldNetInflow + (inflow - outflow)) * dt / surfArea);
+    }
+    #endif
+
     // --- determine average net flow volume into node over the time step
     dQ = inflow - outflow;
     dV = 0.5 * (oldNetInflow + dQ) * dt;
@@ -421,7 +437,19 @@ __device__ void gpu_setNodeDepth(
 
         // --- apply under-relaxation
         if (steps > 0) {
+            #ifdef GPU_DEBUG_SURF
+            if (i == 926 && steps <= 3) {
+                printf("  RELAX[i=%d step=%d]: yLast=%.6f yNew_raw=%.6f omega=%.3f\n",
+                       i, steps, yLast, yNew, omega);
+            }
+            #endif
             yNew = (1.0 - omega) * yLast + omega * yNew;
+            #ifdef GPU_DEBUG_SURF
+            if (i == 926 && steps <= 3) {
+                printf("  RELAX[i=%d step=%d]: yNew_relaxed=%.6f (moved %.6f)\n",
+                       i, steps, yNew, yNew - yLast);
+            }
+            #endif
         }
 
         // --- don't allow ponded node to drop much below full depth

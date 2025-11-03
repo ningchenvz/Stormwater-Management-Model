@@ -367,6 +367,80 @@ extern "C" int gpu_initializeNonConduitData(void)
         }
 
         printf("    Curves transferred to GPU successfully\n");
+
+        // ===== DEBUG: Validate curve data integrity =====
+        printf("\n    === CURVE DATA VALIDATION ===\n");
+        printf("    Total curves: %d, Total points: %d\n", numCurves, totalPoints);
+
+        // Verify pointOffset matches totalPoints
+        if (pointOffset != totalPoints) {
+            printf("    ERROR: pointOffset (%d) != totalPoints (%d)\n", pointOffset, totalPoints);
+        } else {
+            printf("    ✓ Point offset verification passed\n");
+        }
+
+        // Dump first few curves and storage curves specifically
+        for (int i = 0; i < numCurves; i++) {
+            // Only print storage curves (curveType == STORAGE_CURVE) or first 3 curves
+            // Storage curve type should be 2 based on enums.h
+            int start = g_gpuCurves.h_dataStart[i];
+            int count = g_gpuCurves.h_dataCount[i];
+
+            // Print all storage curves (typically curve indices used by storage nodes)
+            // We'll print curves 0-15 to catch most storage curves
+            if (i <= 15 || count == 0) {
+                printf("    Curve %d: type=%d start=%d count=%d dxMin=%.6f\n",
+                       i, g_gpuCurves.h_curveType[i], start, count, g_gpuCurves.h_dxMin[i]);
+
+                if (count > 0 && count <= 20) {
+                    printf("      CPU linked list: ");
+                    TTableEntry* entry = Curve[i].firstEntry;
+                    int idx = 0;
+                    while (entry && idx < 10) {
+                        printf("(%.3f,%.1f) ", entry->x, entry->y);
+                        entry = entry->next;
+                        idx++;
+                    }
+                    if (count > 10) printf("... (%d more)", count - 10);
+                    printf("\n");
+
+                    printf("      GPU SoA arrays:  ");
+                    for (int j = 0; j < count && j < 10; j++) {
+                        printf("(%.3f,%.1f) ",
+                               g_gpuCurvePoints.h_xValues[start + j],
+                               g_gpuCurvePoints.h_yValues[start + j]);
+                    }
+                    if (count > 10) printf("... (%d more)", count - 10);
+                    printf("\n");
+
+                    // Verify CPU vs GPU match
+                    entry = Curve[i].firstEntry;
+                    bool mismatch = false;
+                    for (int j = 0; j < count; j++) {
+                        if (!entry) {
+                            printf("      ERROR: CPU curve has fewer points than expected\n");
+                            mismatch = true;
+                            break;
+                        }
+                        if (fabs(entry->x - g_gpuCurvePoints.h_xValues[start + j]) > 1e-9 ||
+                            fabs(entry->y - g_gpuCurvePoints.h_yValues[start + j]) > 1e-9) {
+                            printf("      ERROR: Point %d mismatch: CPU(%.6f,%.6f) GPU(%.6f,%.6f)\n",
+                                   j, entry->x, entry->y,
+                                   g_gpuCurvePoints.h_xValues[start + j],
+                                   g_gpuCurvePoints.h_yValues[start + j]);
+                            mismatch = true;
+                            break;
+                        }
+                        entry = entry->next;
+                    }
+                    if (!mismatch) {
+                        printf("      ✓ CPU/GPU data match verified\n");
+                    }
+                }
+                printf("\n");
+            }
+        }
+        printf("    === END CURVE VALIDATION ===\n\n");
     }
 
     // Step 2: Initialize Pump Data

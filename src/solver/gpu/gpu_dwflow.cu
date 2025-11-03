@@ -500,17 +500,48 @@ __global__ void kernel_findConduitFlows(
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
 
+    // DEBUG: Log first few threads to confirm kernel is executing
+    if (j == 0 && steps <= 2) {
+        printf("KERNEL: kernel_findConduitFlows executing (thread 0, step=%d)\n", steps);
+        printf("  links->count=%d links->d_type[0]=%d links->d_bypassed[0]=%d\n",
+               links->count, links->d_type[0], links->d_bypassed[0]);
+    }
+
     if (j >= links->count) return;
 
     // Skip non-conduits
-    if (links->d_type[j] != 0) return;  // 0 = CONDUIT
+    if (links->d_type[j] != 0) {
+        if (j < 5 && steps <= 2) {
+            printf("KERNEL: link %d skipped (type=%d, not conduit)\n", j, links->d_type[j]);
+        }
+        return;  // 0 = CONDUIT
+    }
 
     // Skip bypassed links
-    if (links->d_bypassed[j]) return;
+    if (links->d_bypassed[j]) {
+        if (j < 5 && steps <= 2) {
+            printf("KERNEL: link %d skipped (bypassed)\n", j);
+        }
+        return;
+    }
+
+    // DEBUG: Log first conduit that passes all checks
+    static __device__ int firstConduitLogged = 0;
+    if (atomicCAS(&firstConduitLogged, 0, 1) == 0 && steps <= 2) {
+        printf("KERNEL: First active conduit j=%d k=%d processing (step=%d)\n", j, links->d_subIndex[j], steps);
+    }
 
     int k = links->d_subIndex[j];  // Conduit index
     int n1 = links->d_node1[j];    // Upstream node
     int n2 = links->d_node2[j];    // Downstream node
+
+    // DEBUG: Log node depths for first few conduits
+    if (j < 5 && steps <= 2) {
+        printf("KERNEL: link[%d] nodes n1=%d n2=%d depths: newDepth[n1]=%.6f newDepth[n2]=%.6f\n",
+               j, n1, n2, nodes->d_newDepth[n1], nodes->d_newDepth[n2]);
+        printf("  oldDepth[n1]=%.6f oldDepth[n2]=%.6f\n",
+               nodes->d_oldDepth[n1], nodes->d_oldDepth[n2]);
+    }
 
     // Create xsect structure for this link from GPU arrays
     GPU_Xsect xsect;
@@ -518,7 +549,10 @@ __global__ void kernel_findConduitFlows(
     xsect.yFull = xsects->d_yFull[j];
     xsect.aFull = xsects->d_aFull[j];
     xsect.rFull = xsects->d_rFull[j];
+    xsect.pFull = (xsect.aFull > 0.0 && xsect.rFull > 0.0) ? xsect.aFull / xsect.rFull : 0.0;
     xsect.wMax = xsects->d_wMax[j];
+    xsect.sBot = xsects->d_geom2[j];   // Side slope for TRIANGULAR/TRAPEZOIDAL
+    xsect.rBot = xsects->d_geom2[j];   // Bottom radius for PARABOLIC
     xsect.geom1 = xsects->d_geom1[j];  // Diameter, width, etc.
     xsect.geom2 = xsects->d_geom2[j];  // Height, side slope, etc.
     xsect.geom3 = xsects->d_geom3[j];  // Additional geometry
@@ -536,6 +570,8 @@ __global__ void kernel_findConduitFlows(
         nodes->d_invertElev[n1],
         nodes->d_newDepth[n2],
         nodes->d_invertElev[n2],
+        nodes->d_type[n1],          // Node type for flow classification
+        nodes->d_type[n2],          // Node type for flow classification
         // Link data
         links->d_offset1[j],
         links->d_offset2[j],
@@ -546,6 +582,8 @@ __global__ void kernel_findConduitFlows(
         conduits->d_roughFactor[k],
         conduits->d_q1[k],
         conduits->d_a2[k],
+        conduits->d_beta[k],        // Discharge factor for normal depth
+        conduits->d_qMax[k],        // Maximum flow for normal depth
         // Iteration parameters
         steps,
         omega,
@@ -570,6 +608,13 @@ __global__ void kernel_findConduitFlows(
     conduits->d_a1[k] = aMid;
 
     double qTotal = q * barrels;
+
+    // DEBUG: Log first few conduit flow writes
+    if (j < 5 && steps <= 2) {
+        printf("KERNEL: Writing link[%d].newFlow = %.6f (q=%.6f barrels=%.1f)\n",
+               j, qTotal, q, barrels);
+    }
+
     links->d_newFlow[j] = qTotal;
     links->d_newDepth[j] = yMid;
     links->d_newVolume[j] = aMid * conduits->d_length[k] * barrels;
@@ -682,6 +727,17 @@ __global__ void kernel_findPumpFlows(
 
     // Apply setting
     qIn *= setting;
+
+    // DEBUG: Log pump flows for pumps 1,2,3 feeding STOR-10 (first 3 Picard iterations)
+    #ifdef GPU_DEBUG_SURF
+    if ((k == 1 || k == 2 || k == 3) && steps <= 3) {
+        printf("GPU_PUMP[step=%d k=%d link=%d]: n1=%d n2=%d type=%d qIn=%.6f setting=%.3f\n",
+               steps, k, j, n1, n2, pumpType, qIn, setting);
+        printf("  n1_newVol=%.3f n1_newDepth=%.6f n1_fullVol=%.3f\n",
+               nodes->d_newVolume[n1], nodes->d_newDepth[n1], nodes->d_fullVolume[n1]);
+    }
+    #endif
+
     // TODO: Implement parallel-safe pump flow modification
     // The CPU version uses Node[j].outflow which is built up sequentially,
     // but this doesn't work in parallel GPU execution
@@ -894,6 +950,15 @@ __global__ void kernel_processPumpsSequentially(
     int n1 = links->d_node1[j];
     int n2 = links->d_node2[j];
 
+#ifdef GPU_DEBUG_SURF
+    // DEBUG: Log node 926 (STOR-10) state when pump 1 or 2 runs
+    if ((k == 1 || k == 2) && n1 == 926) {
+        printf("GPU pump[%d] sees node %d: inflow=%.6f outflow=%.6f oldNet=%.6f oldVol=%.6f\n",
+               k, n1, nodes->d_inflow[n1], nodes->d_outflow[n1],
+               nodes->d_oldNetInflow[n1], nodes->d_oldVolume[n1]);
+    }
+#endif
+
     bool logPump = (k == 1 || k == 15 || k == 20 || k == 22 || k == 24 || k == 25 || k == 26 ||
                     k == 32 || k == 35 || k == 38 || k == 41 || k == 43 || k == 45);
     int debugSlot = -1;
@@ -1017,6 +1082,26 @@ __global__ void kernel_processPumpsSequentially(
     links->d_newDepth[j] = 0.0;
     links->d_dqdh[j] = dqdh;
     links->d_flowClass[j] = flowClass;
+
+    // STEP 3b: Compute surface area contributions (like CPU findNonConduitSurfArea)
+    // NOTE: Pumps don't have surface area themselves, but we call this for consistency
+    // and to match CPU logic structure. The function will return 0.0 for pumps.
+    double surfArea1 = 0.0, surfArea2 = 0.0;
+    gpu_findNonConduitSurfArea(
+        links->d_type[j], n1, n2,
+        0.0,  // Pumps don't have inherent surface area
+        &surfArea1, &surfArea2,
+        nodes->d_type,
+        nodes->d_newDepth,
+        nodes->d_crownElev,
+        nodes->d_invertElev);
+
+    links->d_surfArea1[j] = surfArea1;
+    links->d_surfArea2[j] = surfArea2;
+
+    // Accumulate surface areas to nodes (no atomicAdd needed - we're sequential)
+    nodes->d_newSurfArea[n1] += surfArea1;
+    nodes->d_newSurfArea[n2] += surfArea2;
 
     // STEP 4: IMMEDIATELY update node flows (EXACTLY like CPU updateNodeFlows!)
     // No atomicAdd needed - we're sequential
@@ -1174,8 +1259,28 @@ __global__ void kernel_findOrificeFlows(
     links->d_newFlow[j] = qNew;
     links->d_newDepth[j] = yFull * links->d_setting[j];
     links->d_dqdh[j] = dqdh;
-    links->d_flowClass[j] = (hcrest > h2) ?
+    int flowClass = (hcrest > h2) ?
         ((dir == 1.0) ? 6 : 5) : 3; // DN_CRITICAL : UP_CRITICAL : SUBCRITICAL
+    links->d_flowClass[j] = flowClass;
+
+    // Compute surface area contributions (like CPU findNonConduitSurfArea)
+    // For orifices: surfArea = aFull / 2.0 (CPU: dynwave.c:723)
+    double surfArea1 = 0.0, surfArea2 = 0.0;
+    gpu_findNonConduitSurfArea(
+        links->d_type[j], n1, n2,
+        aFull / 2.0,  // Orifice surface area = full area / 2
+        &surfArea1, &surfArea2,
+        nodes->d_type,
+        nodes->d_newDepth,
+        nodes->d_crownElev,
+        nodes->d_invertElev);
+
+    links->d_surfArea1[j] = surfArea1;
+    links->d_surfArea2[j] = surfArea2;
+
+    // Accumulate surface areas to nodes
+    atomicAdd(&nodes->d_newSurfArea[n1], surfArea1);
+    atomicAdd(&nodes->d_newSurfArea[n2], surfArea2);
 
     // Update node flows
     if (qNew >= 0.0) {
@@ -1306,6 +1411,25 @@ __global__ void kernel_findWeirFlows(
     links->d_flowClass[j] = (hcrest > h2) ?
         ((dir == 1.0) ? 6 : 5) : 3; // DN_CRITICAL : UP_CRITICAL : SUBCRITICAL
 
+    // Compute surface area contributions (like CPU findNonConduitSurfArea)
+    // For weirs: surfArea = 0.0 (CPU: dynwave.c:729 - SWMM 4 compatibility)
+    double surfArea1 = 0.0, surfArea2 = 0.0;
+    gpu_findNonConduitSurfArea(
+        links->d_type[j], n1, n2,
+        0.0,  // Weir surface area = 0.0 for SWMM 4 compatibility
+        &surfArea1, &surfArea2,
+        nodes->d_type,
+        nodes->d_newDepth,
+        nodes->d_crownElev,
+        nodes->d_invertElev);
+
+    links->d_surfArea1[j] = surfArea1;
+    links->d_surfArea2[j] = surfArea2;
+
+    // Accumulate surface areas to nodes
+    atomicAdd(&nodes->d_newSurfArea[n1], surfArea1);
+    atomicAdd(&nodes->d_newSurfArea[n2], surfArea2);
+
     // Update node flows
     if (qNew >= 0.0) {
         atomicAdd(&nodes->d_outflow[n1], qNew);
@@ -1409,6 +1533,25 @@ __global__ void kernel_findOutletFlows(
     links->d_newDepth[j] = head;
     links->d_flowClass[j] = 3; // SUBCRITICAL
 
+    // Compute surface area contributions (like CPU findNonConduitSurfArea)
+    // For outlets: surfArea = 0.0 (CPU: dynwave.c:729)
+    double surfArea1 = 0.0, surfArea2 = 0.0;
+    gpu_findNonConduitSurfArea(
+        links->d_type[j], n1, n2,
+        0.0,  // Outlet surface area = 0.0
+        &surfArea1, &surfArea2,
+        nodes->d_type,
+        nodes->d_newDepth,
+        nodes->d_crownElev,
+        nodes->d_invertElev);
+
+    links->d_surfArea1[j] = surfArea1;
+    links->d_surfArea2[j] = surfArea2;
+
+    // Accumulate surface areas to nodes
+    atomicAdd(&nodes->d_newSurfArea[n1], surfArea1);
+    atomicAdd(&nodes->d_newSurfArea[n2], surfArea2);
+
     // Update node flows
     if (qNew >= 0.0) {
         atomicAdd(&nodes->d_outflow[n1], qNew);
@@ -1471,12 +1614,25 @@ int launchLinkFlowKernels(
     int blockSize = DEFAULT_BLOCK_SIZE;
     int gridSize = GRID_SIZE(g_conduitKernelCtx.links.count, blockSize);
 
+    // DEBUG: Log kernel launch parameters
+    static int launchCount = 0;
+    if (launchCount < 3) {
+        printf("  Launching kernel_findConduitFlows: gridSize=%d blockSize=%d linkCount=%d conduitCount=%d\n",
+               gridSize, blockSize, g_conduitKernelCtx.links.count, g_conduitKernelCtx.conduits.count);
+        printf("    d_links=%p d_conduits=%p dt=%.6f\n", d_links, d_conduits, dt);
+    }
+    launchCount++;
+
     // Launch conduit flow kernel
     kernel_findConduitFlows<<<gridSize, blockSize, 0, stream>>>(
         d_links, d_conduits, d_xsects, d_nodes,
         dt, steps, omega,
         surchargeMethod, crownCutoff, inertDamping);
 
+    cudaError_t launchErr = cudaGetLastError();
+    if (launchErr != cudaSuccess) {
+        printf("  KERNEL LAUNCH ERROR: %s\n", cudaGetErrorString(launchErr));
+    }
     CUDA_CHECK_LAST_ERROR();
 
     // Launch orifice kernel if orifices exist
@@ -1909,10 +2065,26 @@ int gpu_computeConduitFlows(
 extern "C" void gpu_flushConduitResults(void)
 {
     if (!g_gpuConfig.useCuda) return;
-    if (!g_conduitKernelCtx.resultsDirty) return;
+    if (!g_conduitKernelCtx.resultsDirty) {
+        printf("    gpu_flushConduitResults: skipping (resultsDirty=0)\n");
+        return;
+    }
 
     gpu_transferLinkDynamicFromDevice(&g_conduitKernelCtx.links, g_conduitKernelCtx.links.count);
     gpu_transferConduitDynamicFromDevice(&g_conduitKernelCtx.conduits, g_conduitKernelCtx.conduits.count);
+
+    // DEBUG: Check what's in h_newFlow after D2H transfer
+    static int flushCallCount = 0;
+    if (flushCallCount < 5) {
+        int nonZeroInHost = 0;
+        for (int i = 0; i < MIN(g_conduitKernelCtx.links.count, 100); i++) {
+            if (fabs(g_conduitKernelCtx.links.h_newFlow[i]) > 0.01) nonZeroInHost++;
+        }
+        printf("    After D2H transfer: %d/%d links in h_newFlow have non-zero values\n",
+               nonZeroInHost, MIN(g_conduitKernelCtx.links.count, 100));
+    }
+    flushCallCount++;
+
     copyLinksFromGpu(&g_conduitKernelCtx.links);
     copyConduitsFromGpu(&g_conduitKernelCtx.conduits);
     g_conduitKernelCtx.resultsDirty = 0;

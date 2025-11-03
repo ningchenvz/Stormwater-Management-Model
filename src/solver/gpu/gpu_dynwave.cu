@@ -101,6 +101,16 @@ __global__ void kernel_resetNodeAccumulators(
                debugPrint, latFlow, nodes->d_losses[i]);
     }
 
+#ifdef GPU_DEBUG_SURF
+    // DEBUG: Print STOR-10 (node 926) reset values
+    if (i == 926 && debugPrint > 0 && debugPrint <= 3) {
+        printf("RESET_STOR10[iter=%d node=%d]: BEFORE reset: inflow=%.6f outflow=%.6f\n",
+               debugPrint, i, nodes->d_inflow[i], nodes->d_outflow[i]);
+        printf("  latFlow=%.6f losses=%.6f oldNetInflow=%.6f\n",
+               latFlow, nodes->d_losses[i], nodes->d_oldNetInflow[i]);
+    }
+#endif
+
     if (latFlow >= 0.0) {
         nodes->d_inflow[i] = latFlow;
         nodes->d_outflow[i] = nodes->d_losses[i];
@@ -108,6 +118,14 @@ __global__ void kernel_resetNodeAccumulators(
         nodes->d_inflow[i] = 0.0;
         nodes->d_outflow[i] = nodes->d_losses[i] - latFlow;
     }
+
+#ifdef GPU_DEBUG_SURF
+    // DEBUG: Print STOR-10 (node 926) after reset
+    if (i == 926 && debugPrint > 0 && debugPrint <= 3) {
+        printf("RESET_STOR10[iter=%d node=%d]: AFTER reset: inflow=%.6f outflow=%.6f\n",
+               debugPrint, i, nodes->d_inflow[i], nodes->d_outflow[i]);
+    }
+#endif
 
     // Reset sumdqdh
     nodes->d_sumdqdh[i] = 0.0;
@@ -303,6 +321,17 @@ __global__ void kernel_findNodeDepths(
     // Check convergence
     double depthChange = fabs(newDepth - yOld);
     nodes->d_converged[i] = (depthChange <= headTol) ? 1 : 0;
+
+    // DEBUG: Trace convergence for problem storage nodes (first 3 Picard iterations only)
+    #ifdef GPU_DEBUG_SURF
+    if ((i == 926 || i == 927 || i == 928) && steps <= 3 && !nodes->d_converged[i]) {
+        printf("CONVERGE_FAIL[step=%d node=%d]: depthChange=%.6f > headTol=%.6f (%.1fx)\n",
+               steps, i, depthChange, headTol, depthChange / headTol);
+        printf("  yOld=%.6f → newDepth=%.6f (Δ=%.6f ft)\n", yOld, newDepth, depthChange);
+        printf("  nodeType=%d inflow=%.6f outflow=%.6f\n",
+               nodes->d_type[i], nodes->d_inflow[i], nodes->d_outflow[i]);
+    }
+    #endif
 }
 
 //=============================================================================
@@ -1037,6 +1066,17 @@ extern "C" int gpu_runPersistentPicardIteration(
 
     // Initial transfer: Copy node, link, and conduit data to GPU ONCE
     copyNodesToGpu(nodes);
+
+    // DEBUG: Check what node depths we're sending to GPU
+    static int transferDebugCount = 0;
+    if (transferDebugCount < 3) {
+        printf("  Before GPU transfer: CPU Node[0].newDepth=%.6f Node[1].newDepth=%.6f\n",
+               Node[0].newDepth, Node[1].newDepth);
+        printf("  After copyNodesToGpu: h_newDepth[0]=%.6f h_newDepth[1]=%.6f\n",
+               nodes->h_newDepth[0], nodes->h_newDepth[1]);
+    }
+    transferDebugCount++;
+
     copyLinksToGpu(links);
     copyConduitsToGpu(conduits);
 
@@ -1045,6 +1085,13 @@ extern "C" int gpu_runPersistentPicardIteration(
     CUDA_CHECK(cudaMemcpy(d_conduits, conduits, sizeof(GPU_ConduitData), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_xsects, xsects, sizeof(GPU_XsectData), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_nodes, nodes, sizeof(GPU_NodeData), cudaMemcpyHostToDevice));
+
+    // DEBUG: Log dt value for first few routing steps
+    static int routingStepCount = 0;
+    if (routingStepCount < 10) {
+        printf("GPU gpu_runPersistentPicardIteration[step=%d]: dt=%.6f\n", routingStepCount, dt);
+    }
+    routingStepCount++;
 
     // Allocate device memory for convergence counter
     int* d_convergedCount;
@@ -1079,6 +1126,27 @@ extern "C" int gpu_runPersistentPicardIteration(
             cudaFree(d_convergedCount);
             return -1;
         }
+
+        // === DEBUG: Sample device-side flows after conduit kernel ===
+        static int picardStepCount = 0;
+        if (picardStepCount < 3 && iter == 0) {
+            // Copy a few sample flows from device to verify kernel computed them
+            double h_sampleFlows[10];
+            CUDA_CHECK(cudaMemcpy(h_sampleFlows, links->d_newFlow,
+                                 MIN(10, links->count) * sizeof(double),
+                                 cudaMemcpyDeviceToHost));
+            int nonZeroSamples = 0;
+            for (int s = 0; s < MIN(10, links->count); s++) {
+                if (fabs(h_sampleFlows[s]) > 0.01) nonZeroSamples++;
+            }
+            printf("  DEBUG[step=%d iter=%d]: After link kernels, %d/%d sampled d_newFlow are non-zero\n",
+                   picardStepCount, iter, nonZeroSamples, MIN(10, links->count));
+            if (nonZeroSamples > 0) {
+                printf("    Sample flows: [0]=%.3f [1]=%.3f [2]=%.3f\n",
+                       h_sampleFlows[0], h_sampleFlows[1], h_sampleFlows[2]);
+            }
+        }
+        if (iter == maxIterations - 1) picardStepCount++;
 
         // === OUTFALL DEPTHS (set boundary conditions based on link flows) ===
         // This mirrors CPU's link_setOutfallDepth() at dynwave.c:817

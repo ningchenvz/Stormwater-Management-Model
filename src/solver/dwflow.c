@@ -547,6 +547,19 @@ void findSurfArea(int j, double q, double length, double* h1, double* h2,
     Link[j].surfArea2 = surfArea2;
     *y1 = flowDepth1;
     *y2 = flowDepth2;
+
+#ifdef GPU_DEBUG_SURF
+    // DEBUG: Log surface areas for first few conduits (mirror GPU instrumentation)
+    // Only log first 50 calls to avoid spam
+    static int cpu_surf_calls = 0;
+    if (cpu_surf_calls < 100) {
+        cpu_surf_calls++;
+        printf("CPU_SURF[call=%d link=%d node1=%d node2=%d]: flowClass=%d fasnh=%.3f yC=%.3f yN=%.3f\n",
+               cpu_surf_calls, j, n1, n2, Link[j].flowClass, fasnh, criticalDepth, normalDepth);
+        printf("  y1=%.3f y2=%.3f → surfArea1=%.3f surfArea2=%.3f (length=%.1f)\n",
+               flowDepth1, flowDepth2, surfArea1, surfArea2, length);
+    }
+#endif
 }
 
 //=============================================================================
