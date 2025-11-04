@@ -197,21 +197,57 @@ __global__ void kernel_resetNodeAccumulators(
 // This eliminates non-deterministic atomicAdd ordering that caused 3-9% depth
 // differences between GPU and CPU, leading to poor Picard convergence.
 //
+// Accumulation modes
+#define ACCUM_MODE_CONDUITS_ONLY 0
+#define ACCUM_MODE_ALL 1
+#define ACCUM_MODE_NON_CONDUITS_ONLY 2
+
+//=============================================================================
+// Kernel: Zero Node Accumulators Before Final Accumulation
+//=============================================================================
+// Purpose: Reset node accumulator arrays to base values (lateral inflow, losses)
+//          before the final ALL-mode accumulation pass
+//
+// This is needed for the two-pass pump flow integration strategy:
+//   Pass 1: Accumulate conduits only → pumps read node state for getModPumpFlow
+//   Pass 2: Zero accumulators, then accumulate ALL (conduits + pumps together)
+//           → This ensures depth solver sees the complete flow picture
+//
+__global__ void kernel_zeroNodeAccumulatorsForFinalPass(
+    GPU_NodeData* nodes)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nodes->count) return;
+
+    // Reset to base values (lateral inflow, losses, intrinsic surface area, zero dqdh)
+    // These are the same initial values that kernel_resetNodeAccumulators sets
+    nodes->d_inflow[i] = nodes->d_newLatFlow[i];
+    nodes->d_outflow[i] = nodes->d_losses[i];
+    nodes->d_sumdqdh[i] = 0.0;
+    // Keep d_newSurfArea as is - it was set by resetNodeAccumulators from depth
+    // and represents the node's intrinsic surface area (not from links)
+}
+
 __global__ void kernel_accumulateNodeContributions(
     GPU_NodeData* nodes,
     GPU_LinkContribution* contributions,
     GPU_LinkData* links,
-    int numLinks)
+    int numLinks,
+    int mode,
+    int numConduits)
 //
 //  Input:   nodes = node data structure
 //           contributions = per-link contribution arrays (written by link kernels)
 //           links = link data structure (for node connectivity)
 //           numLinks = total number of links
+//           mode = ACCUM_MODE_CONDUITS_ONLY or ACCUM_MODE_ALL
+//           numConduits = number of conduits (only used in CONDUITS_ONLY mode)
 //
 //  Output:  Updates nodes->d_inflow, d_outflow, d_newSurfArea, d_sumdqdh
 //
 //  Notes:   Links are processed in the order they appear in the links array,
 //           which matches the CPU's sorted link order (SortedLinks array)
+//           In CONDUITS_ONLY mode, only processes first numConduits links
 //
 {
     int nodeIdx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -232,9 +268,22 @@ __global__ void kernel_accumulateNodeContributions(
                nodeIdx, surfArea);
     }
 
-    // Accumulate contributions from all links in CPU order (serial loop is OK - only ~10-100 links per node)
+    // Determine link range to process based on mode
+    int startIdx, endIdx;
+    if (mode == ACCUM_MODE_CONDUITS_ONLY) {
+        startIdx = 0;
+        endIdx = numConduits;
+    } else if (mode == ACCUM_MODE_NON_CONDUITS_ONLY) {
+        startIdx = numConduits;
+        endIdx = numLinks;
+    } else { // ACCUM_MODE_ALL
+        startIdx = 0;
+        endIdx = numLinks;
+    }
+
+    // Accumulate contributions from links in CPU order (serial loop is OK - only ~10-100 links per node)
     // CRITICAL: Links are processed in array order, matching CPU's SortedLinks traversal
-    for (int linkIdx = 0; linkIdx < numLinks; linkIdx++) {
+    for (int linkIdx = startIdx; linkIdx < endIdx; linkIdx++) {
         int n1 = links->d_node1[linkIdx];  // Upstream node
         int n2 = links->d_node2[linkIdx];  // Downstream node
 
@@ -243,11 +292,11 @@ __global__ void kernel_accumulateNodeContributions(
         // Check if this link contributes to current node
         if (n1 == nodeIdx) {
             // This node is upstream end of link
-            // DEBUG: Log link contributions to node 830 at step 2 (first occurrence only)
-            if (nodeIdx == 830 && g_depthRoutingStepCounter == 2) {
-                if (fabs(c->node1_outflow) > 0.0001 || fabs(c->node1_inflow) > 0.0001) {  // Log all contributions
-                    printf("  LINK%d→NODE830(upstream): inflow+=%.6f outflow+=%.6f (out: was %.6f now %.6f)\n",
-                           linkIdx, c->node1_inflow, c->node1_outflow, outflow, outflow + c->node1_outflow);
+            // DEBUG: Log link contributions to problematic nodes (2,12,15,18) at step 6
+            if (g_depthRoutingStepCounter == 6 && (nodeIdx == 2 || nodeIdx == 12 || nodeIdx == 15 || nodeIdx == 18)) {
+                if (fabs(c->node1_outflow) > 0.0001 || fabs(c->node1_inflow) > 0.0001) {
+                    printf("  GPU_LINK%d→NODE%d(upstream): in+=%.6f out+=%.6f\n",
+                           linkIdx, nodeIdx, c->node1_inflow, c->node1_outflow);
                 }
             }
             inflow += c->node1_inflow;
@@ -257,11 +306,11 @@ __global__ void kernel_accumulateNodeContributions(
         }
         else if (n2 == nodeIdx) {
             // This node is downstream end of link
-            // DEBUG: Log link contributions to node 830 at step 2
-            if (nodeIdx == 830 && g_depthRoutingStepCounter == 2) {
-                if (fabs(c->node2_inflow) > 0.0001 || fabs(c->node2_outflow) > 0.0001) {  // Log all contributions
-                    printf("  LINK%d→NODE830(downstream): inflow+=%.6f outflow+=%.6f (out: was %.6f now %.6f)\n",
-                           linkIdx, c->node2_inflow, c->node2_outflow, outflow, outflow + c->node2_outflow);
+            // DEBUG: Log link contributions to problematic nodes (2,12,15,18) at step 6
+            if (g_depthRoutingStepCounter == 6 && (nodeIdx == 2 || nodeIdx == 12 || nodeIdx == 15 || nodeIdx == 18)) {
+                if (fabs(c->node2_inflow) > 0.0001 || fabs(c->node2_outflow) > 0.0001) {
+                    printf("  GPU_LINK%d→NODE%d(downstream): in+=%.6f out+=%.6f\n",
+                           linkIdx, nodeIdx, c->node2_inflow, c->node2_outflow);
                 }
             }
             inflow += c->node2_inflow;
@@ -282,6 +331,14 @@ __global__ void kernel_accumulateNodeContributions(
         printf("GPU_ACCUM[step=%d node=%d]: initialOut=%.6f actualOut=%.6f linkOut=%.6f totalOut=%.6f (ptr=%p)\n",
                g_depthRoutingStepCounter, nodeIdx, initialOutflow, actualOutflow,
                linkOutflow, outflow, (void*)&nodes->d_outflow[nodeIdx]);
+    }
+
+    // DEBUG: Print node 15 accumulation summary at step 2
+    if (nodeIdx == 15 && g_depthRoutingStepCounter == 2) {
+        double linkInflow = inflow - initialInflow;
+        double linkOutflow = outflow - initialOutflow;
+        printf("GPU_ACCUM_NODE15[step=2]: lateral=%.9f linkInflow=%.9f totalInflow=%.9f linkOutflow=%.9f totalOutflow=%.9f\n",
+               initialInflow, linkInflow, inflow, linkOutflow, outflow);
     }
 
     // Write final accumulated values (atomic-free, deterministic)
@@ -1474,24 +1531,88 @@ extern "C" int gpu_runPersistentPicardIteration(
         }
         if (iter == maxIterations - 1) picardStepCount++;
 
-        // === STAGE 2: ACCUMULATE LINK CONTRIBUTIONS (deterministic summation) ===
-        // Sum link contributions into node accumulators in CPU-matching order
-        // This replaces non-deterministic atomicAdd calls in link kernels
+        // === STAGE 2: PARTIAL ACCUMULATION (conduits only for pump input) ===
+        // Accumulate ONLY conduit contributions so pumps can read node->d_outflow
+        // for getModPumpFlow() over-drain prevention
         static int accumDebugCount = 0;
+        extern int Nlinks[];
+        int numConduits = Nlinks[CONDUIT];
         if (accumDebugCount < 3 && iter == 0) {
-            printf("  GPU_ACCUM[step=%d iter=%d]: Launching accumulation kernel for %d nodes, %d links\n",
-                   routingStepNum, iter, nodes->count, links->count);
+            printf("  GPU_STAGE2[step=%d iter=%d]: Accumulating %d conduits for %d nodes (mode=CONDUITS_ONLY)\n",
+                   routingStepNum, iter, numConduits, nodes->count);
         }
-        if (iter == maxIterations - 1) accumDebugCount++;
-
-        // Removed slow pre-launch verification
 
         gridSize = GRID_SIZE(nodes->count, blockSize);
         kernel_accumulateNodeContributions<<<gridSize, blockSize, 0, stream>>>(
             d_nodes,
             g_linkContributions.d_contributions,
             d_links,
-            links->count);
+            links->count,
+            ACCUM_MODE_CONDUITS_ONLY,
+            numConduits);
+        CUDA_CHECK_LAST_ERROR();
+
+        // === STAGE 3: PUMP FLOWS (sequential, writes contributions) ===
+        // Pumps read nodes->d_outflow (now has conduits) for getModPumpFlow,
+        // but WRITE to contributions array (not direct node updates)
+        extern GPU_PumpData g_gpuPumps;
+        // Forward declaration of pump kernel wrapper (defined in gpu_dwflow.cu)
+        extern void launchSequentialPumpKernel(
+            GPU_LinkData* d_links, GPU_PumpData* d_gpuPumps, GPU_NodeData* d_nodes,
+            GPU_LinkContribution* d_contributions,
+            GPU_CurveData* d_gpuCurves, GPU_CurvePoints* d_gpuCurvePoints,
+            double dt, int routeModel, double ucfVolume, double ucfLength, double ucfFlow,
+            cudaStream_t stream);
+        if (Nlinks[PUMP] > 0 && g_gpuPumps.count > 0) {
+            // Get unit conversion factors
+            double ucfVolume = UCF(VOLUME);
+            double ucfLength = UCF(LENGTH);
+            double ucfFlow = UCF(FLOW);
+            extern int RouteModel;
+            int routeModel = RouteModel;
+
+            launchSequentialPumpKernel(
+                d_links, d_gpuPumps, d_nodes,
+                g_linkContributions.d_contributions,
+                d_gpuCurves, d_gpuCurvePoints,
+                dt, routeModel,
+                ucfVolume, ucfLength, ucfFlow,
+                stream);
+            CUDA_CHECK_LAST_ERROR();
+        }
+
+        // === STAGE 4: ZERO + FINAL ACCUMULATION (ALL contributions) ===
+        // CRITICAL FIX (Iteration 7): Zero node accumulators then re-accumulate ALL
+        // This prevents double-counting and ensures depth solver sees complete flow picture
+        //
+        // Old approach (Iteration 6): Accumulated NON_CONDUITS_ONLY on top of CONDUITS
+        //   Problem: Stage 2 conduits were never cleared, so depth solver saw:
+        //     node.outflow = losses + conduits + (conduits + pumps)  [DOUBLE-COUNTED!]
+        //
+        // New approach (Iteration 7): Zero accumulators, then sum ALL contributions
+        //   Result: depth solver sees correct totals:
+        //     node.outflow = losses + conduits + pumps  [CORRECT]
+        //
+        if (accumDebugCount < 3 && iter == 0) {
+            printf("  GPU_STAGE4[step=%d iter=%d]: Zeroing accumulators + accumulating ALL (mode=ALL)\n",
+                   routingStepNum, iter);
+        }
+        if (iter == maxIterations - 1) accumDebugCount++;
+
+        // Step 4a: Zero node accumulators (reset to lateral/losses)
+        gridSize = GRID_SIZE(nodes->count, blockSize);
+        kernel_zeroNodeAccumulatorsForFinalPass<<<gridSize, blockSize, 0, stream>>>(d_nodes);
+        CUDA_CHECK_LAST_ERROR();
+
+        // Step 4b: Accumulate ALL contributions (conduits + pumps + orifices + weirs + outlets)
+        gridSize = GRID_SIZE(nodes->count, blockSize);
+        kernel_accumulateNodeContributions<<<gridSize, blockSize, 0, stream>>>(
+            d_nodes,
+            g_linkContributions.d_contributions,
+            d_links,
+            links->count,
+            ACCUM_MODE_ALL,  // Changed from NON_CONDUITS_ONLY to ALL
+            numConduits);
         CUDA_CHECK_LAST_ERROR();
 
         // === OUTFALL DEPTHS (set boundary conditions based on link flows) ===

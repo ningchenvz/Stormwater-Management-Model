@@ -1001,6 +1001,7 @@ __global__ void kernel_processPumpsSequentially(
     GPU_LinkData* links,
     GPU_PumpData* pumps,
     GPU_NodeData* nodes,
+    GPU_LinkContribution* contributions,
     GPU_CurveData* curves,
     GPU_CurvePoints* curvePoints,
     double dt,
@@ -1009,9 +1010,10 @@ __global__ void kernel_processPumpsSequentially(
     double ucfLength,
     double ucfFlow)
 //
-//  Purpose: Process ALL pumps sequentially in a single kernel, EXACTLY like CPU.
-//           Each pump: compute flow → getModPumpFlow → update nodes → next pump
-//           This ensures each pump sees the exact state the CPU sees.
+//  Purpose: Process ALL pumps sequentially, writing to contribution arrays.
+//           Each pump: compute flow → getModPumpFlow → write contributions
+//           NOTE: Pumps read nodes->d_outflow (pre-accumulated conduits) for getModPumpFlow,
+//                 but write to contributions array (NOT direct node updates)
 //
 {
     // Single thread processes ALL pumps sequentially
@@ -1185,51 +1187,82 @@ __global__ void kernel_processPumpsSequentially(
     links->d_surfArea1[j] = surfArea1;
     links->d_surfArea2[j] = surfArea2;
 
-    // Accumulate surface areas to nodes (no atomicAdd needed - we're sequential)
-    nodes->d_newSurfArea[n1] += surfArea1;
-    nodes->d_newSurfArea[n2] += surfArea2;
+    // STEP 4a: CRITICAL FIX - Update node arrays immediately for next pump in sequence
+    // This allows subsequent pumps to see the updated in-flight balance, exactly like CPU.
+    // These updates are TEMPORARY - kernel_zeroNodeAccumulatorsForFinalPass will reset them
+    // before the final ALL-mode accumulation, so no double-counting occurs.
+    //
+    // Without this fix:
+    //   - Each pump sees stale node state (only conduits, not previous pumps)
+    //   - Multiple pumps on same wet well over-estimate available volume
+    //   - Storage drains too fast (half the correct rate)
+    //   - Causes high-frequency cycling (35-54 starts vs CPU 1)
+    //   - Downstream junctions overflow (84x flooding vs CPU)
+    //
+    double outflowBefore = nodes->d_outflow[n1];
+    nodes->d_outflow[n1] += qIn;  // Pump draws from upstream node
+    nodes->d_inflow[n2] += qIn;   // Pump delivers to downstream node
 
-    // STEP 4: IMMEDIATELY update node flows (EXACTLY like CPU updateNodeFlows!)
-    // No atomicAdd needed - we're sequential
-    nodes->d_outflow[n1] += qIn;
-    nodes->d_inflow[n2] += qIn;
+    // DEBUG: Log the update for first few pumps to verify nodes are being updated
+    if (k < 3 && qIn > 0.001) {
+        printf("PUMP_UPDATE[pump=%d node1=%d node2=%d]: outflow[%d]: %.6f → %.6f (+%.6f)\n",
+               k, n1, n2, n1, outflowBefore, nodes->d_outflow[n1], qIn);
+    }
 
-    double inflowUpAfter = nodes->d_inflow[n1];
-    double outflowUpAfter = nodes->d_outflow[n1];
-    double inflowDownAfter = nodes->d_inflow[n2];
+    // STEP 4b: Write contributions for final accumulation pass
+    // The kernel_accumulateNodeContributions (ALL mode) will sum these with conduit contributions
+    GPU_LinkContribution* contrib = &contributions[j];
+
+    // Pumps always flow from n1 (upstream) to n2 (downstream)
+    contrib->node1_outflow = qIn;
+    contrib->node1_inflow = 0.0;
+    contrib->node2_inflow = qIn;
+    contrib->node2_outflow = 0.0;
+
+    // Surface area contributions
+    contrib->node1_surfArea = surfArea1;
+    contrib->node2_surfArea = surfArea2;
+
+    // dqdh contributions
+    contrib->node1_sumdqdh = dqdh;
+    if (pumpType != TYPE4_PUMP) {
+        contrib->node2_sumdqdh = dqdh;
+    } else {
+        contrib->node2_sumdqdh = 0.0;
+    }
 
     if (logPump && debugSlot > -1 && debugSlot < 20) {
-        printf("GPU pump[%d] node update: newOut=%.6f newIn=%.6f\n",
-               k, nodes->d_outflow[n1], nodes->d_inflow[n2]);
-    }
-
-    if (logPump && debugSlot > -1 && debugSlot < GPU_PUMP_DEBUG_MAX) {
-        GPUPumpDebugEntry* entry = &g_gpuPumpDebugEntries[k * GPU_PUMP_DEBUG_MAX + debugSlot];
-        entry->dt = dt;
-        entry->qCurve = qCurve;
-        entry->qFinal = qIn;
-        entry->oldVolume = nodes->d_oldVolume[n1];
-        entry->inflowBeforeUp = inflowUpBefore;
-        entry->outflowBeforeUp = outflowUpBefore;
-        entry->inflowAfterUp = inflowUpAfter;
-        entry->outflowAfterUp = outflowUpAfter;
-        entry->inflowBeforeDown = inflowDownBefore;
-        entry->inflowAfterDown = inflowDownAfter;
-        entry->oldDepth = nodes->d_oldDepth[n1];
-        entry->newSurf = nodes->d_newSurfArea[n1];
-        entry->pumpIndex = k;
-        entry->upNodeIndex = n1;
-        entry->downNodeIndex = n2;
-        entry->callIndex = debugSlot;
-    }
-
-    // Add dqdh contributions just like CPU updateNodeFlows()
-    nodes->d_sumdqdh[n1] += dqdh;
-    if (pumpType != TYPE4_PUMP) {
-        nodes->d_sumdqdh[n2] += dqdh;
+        printf("GPU pump[%d] wrote contrib: n1_out=%.6f n2_in=%.6f\n",
+               k, contrib->node1_outflow, contrib->node2_inflow);
     }
 
     } // End of sequential for loop
+}
+
+//=============================================================================
+// Host wrapper for sequential pump kernel (callable from other CUDA files)
+//=============================================================================
+extern "C" {
+void launchSequentialPumpKernel(
+    GPU_LinkData* d_links,
+    GPU_PumpData* d_gpuPumps,
+    GPU_NodeData* d_nodes,
+    GPU_LinkContribution* d_contributions,
+    GPU_CurveData* d_gpuCurves,
+    GPU_CurvePoints* d_gpuCurvePoints,
+    double dt,
+    int routeModel,
+    double ucfVolume,
+    double ucfLength,
+    double ucfFlow,
+    cudaStream_t stream)
+{
+    kernel_processPumpsSequentially<<<1, 1, 0, stream>>>(
+        d_links, d_gpuPumps, d_nodes, d_contributions,
+        d_gpuCurves, d_gpuCurvePoints,
+        dt, routeModel,
+        ucfVolume, ucfLength, ucfFlow);
+}
 }
 
 //=============================================================================
@@ -1762,14 +1795,10 @@ int launchLinkFlowKernels(
         CUDA_CHECK_LAST_ERROR();
     }
 
-    // Launch pump kernel (SEQUENTIAL - matches CPU behavior)
-    if (Nlinks[PUMP] > 0 && g_gpuPumps.count > 0) {
-        kernel_processPumpsSequentially<<<1, 1, 0, stream>>>(
-            d_links, d_gpuPumps, d_nodes, d_gpuCurves, d_gpuCurvePoints,
-            dt, routeModel,
-            ucfVolume, ucfLength, ucfFlow);
-        CUDA_CHECK_LAST_ERROR();
-    }
+    // NOTE: Pump kernel is NOT called here - it runs AFTER node accumulation
+    // (See gpu_findNodeDepths_Picard in gpu_dynwave.cu)
+    // This is because pumps need to see accumulated conduit flows in nodes->d_outflow
+    // for getModPumpFlow() to work correctly
 
     return 0;
 }
@@ -1985,17 +2014,9 @@ int gpu_computeConduitFlows(
         CUDA_CHECK_LAST_ERROR();
     }
 
-    // PUMP PROCESSING: ENABLED - Process pumps on GPU
-    // FULLY SEQUENTIAL PUMP PROCESSING (Exact CPU Logic)
-    // Process each pump: compute flow → getModPumpFlow → update nodes → next pump
-    // This matches CPU behavior EXACTLY where each pump sees previous pumps' effects
-    if (Nlinks[PUMP] > 0 && g_gpuPumps.count > 0) {
-        kernel_processPumpsSequentially<<<1, 1, 0, stream>>>(
-            d_links, d_gpuPumps, d_nodes, d_gpuCurves, d_gpuCurvePoints,
-            dt, routeModel,
-            ucfVolume, ucfLength, ucfFlow);
-        CUDA_CHECK_LAST_ERROR();
-    }
+    // PUMP PROCESSING: DISABLED in legacy function
+    // Pumps are now handled in the main Picard loop with proper staging
+    // (see gpu_findNodeDepths_Picard in gpu_dynwave.cu)
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 

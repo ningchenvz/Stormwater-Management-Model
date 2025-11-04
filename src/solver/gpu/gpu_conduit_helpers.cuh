@@ -667,6 +667,18 @@ __device__ void gpu_findConduitFlow_simplified(
     // CRITICAL: Adjust flow depths based on flow regime (critical/normal depth)
     // This mirrors CPU dwflow.c::findSurfArea() call at line 157
     double surfArea1_computed, surfArea2_computed;
+    // DEBUG: Track link 816 (connects problematic nodes 247→928)
+    bool debugLink816 = false; // Disabled for clean testing
+    // bool debugLink816 = (j == 816 && g_routingStepCounter <= 5);
+
+    if (debugLink816) {
+        printf("\n=== LINK_816[routeStep=%d iter=%d] START ===\n", g_routingStepCounter, steps);
+        printf("  node1=%d node2=%d qLast=%.6f qOld=%.6f\n", n1, n2, qLast, qOld);
+        printf("  node1_newDepth=%.6f node2_newDepth=%.6f\n", node1_newDepth, node2_newDepth);
+        printf("  CHECK isnan: qLast=%d qOld=%d node1_newDepth=%d node2_newDepth=%d\n",
+               isnan(qLast), isnan(qOld), isnan(node1_newDepth), isnan(node2_newDepth));
+    }
+
     int flowClass_computed;
     gpu_findSurfArea(
         j, xsect, qLast, length,
@@ -677,6 +689,13 @@ __device__ void gpu_findConduitFlow_simplified(
         surchargeMethod, crownCutoff,
         &h1, &h2, &y1, &y2,
         &surfArea1_computed, &surfArea2_computed, &flowClass_computed);
+
+    if (debugLink816) {
+        printf("  AFTER findSurfArea: y1=%.6f y2=%.6f h1=%.6f h2=%.6f flowClass=%d\n",
+               y1, y2, h1, h2, flowClass_computed);
+        printf("  CHECK isnan: y1=%d y2=%d h1=%d h2=%d\n",
+               isnan(y1), isnan(y2), isnan(h1), isnan(h2));
+    }
 
     // DEBUG: Log depth adjustments for link 1 (C2) at step 2-3, iter 0-1
     if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps <= 1) {
@@ -698,6 +717,15 @@ __device__ void gpu_findConduitFlow_simplified(
     aMid = gpu_getArea(xsect, yMid, wSlot);
     rMid = gpu_getHydRad(xsect, yMid);
 
+    if (debugLink816) {
+        printf("  GEOMETRY: y1=%.6f→a1=%.6f→r1=%.6f\n", y1, a1, r1);
+        printf("  GEOMETRY: y2=%.6f→a2=%.6f\n", y2, a2);
+        printf("  GEOMETRY: yMid=%.6f→aMid=%.6f→rMid=%.6f\n", yMid, aMid, rMid);
+        printf("  CHECK isnan: a1=%d a2=%d aMid=%d r1=%d rMid=%d\n",
+               isnan(a1), isnan(a2), isnan(aMid), isnan(r1), isnan(rMid));
+        printf("  CHECK aMid: aMid=%.9f (aMid <= FUDGE: %d)\n", aMid, (aMid <= GPU_FUDGE));
+    }
+
     // DEBUG: Log hydraulic radii for link 1 (C2) at step 2-3, iter 0-1
     if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps <= 1) {
         printf("GPU_HYD_RAD[routingStep=%d iter=%d]: y1=%.6f→r1=%.6f, yMid=%.6f→rMid=%.6f\n",
@@ -707,23 +735,39 @@ __device__ void gpu_findConduitFlow_simplified(
     // Check if flowing full
     isFull = (y1 >= xsect->yFull && y2 >= xsect->yFull) ? 1 : 0;
 
-    // TEMPORARY: Completely disable dry condition check for debugging
-    // This will allow flow computation even with very small/zero depths
-    /*
+    // FIX: Check for dry/near-zero area to prevent divide-by-zero in v = qLast / aMid
+    // This is CRITICAL - without this guard, aMid=0 causes NaN propagation
     if (aMid <= GPU_FUDGE) {
+        if (debugLink816 || (g_routingStepCounter == 1 && steps == 0 && j < 5)) {
+            printf("  DRY CONDITION[link=%d step=%d iter=%d]: aMid=%.9f <= FUDGE (%.9f), a1=%.9f a2=%.9f, setting q=0\n",
+                   j, g_routingStepCounter, steps, aMid, GPU_FUDGE, a1, a2);
+        }
         *q_out = 0.0;
         *aMid_out = 0.5 * (a1 + a2);
         *yMid_out = gpu_MIN(yMid, xsect->yFull);
         *dqdh_out = GPU_GRAVITY * dt * aMid / length * barrels;
         *froude_out = 0.0;
+        // CRITICAL: Must set surface area outputs! These are used for node depth calculations
+        *surfArea1_out = surfArea1_computed;
+        *surfArea2_out = surfArea2_computed;
+        *flowClass_out = flowClass_computed;
         return;
     }
-    */
 
     // Compute velocity from last flow estimate
+    if (debugLink816) {
+        printf("  VELOCITY: About to compute v = qLast / aMid\n");
+        printf("  VELOCITY: qLast=%.6f aMid=%.9f\n", qLast, aMid);
+    }
     v = qLast / aMid;
+    if (debugLink816) {
+        printf("  VELOCITY: v_computed=%.6f isnan(v)=%d isinf(v)=%d\n", v, isnan(v), isinf(v));
+    }
     if (fabs(v) > GPU_MAXVELOCITY) {
         v = GPU_MAXVELOCITY * GPU_SGN(qLast);
+        if (debugLink816) {
+            printf("  VELOCITY: v_clamped=%.6f (exceeded MAXVELOCITY)\n", v);
+        }
     }
 
     // DEBUG: Log qLast and velocity for Link 1 (C2) at step 2-3, iter 0-1
@@ -787,12 +831,29 @@ __device__ void gpu_findConduitFlow_simplified(
         dq4 = dt * v * v * (a2 - a1) / length * sigma;
     }
 
+    if (debugLink816) {
+        printf("  MOMENTUM: froude=%.6f sigma=%.6f rho=%.6f\n", froude, sigma, rho);
+        printf("  MOMENTUM: aWtd=%.6f rWtd=%.6f aOld=%.6f\n", aWtd, rWtd, aOld);
+        printf("  MOMENTUM: dq1(friction)=%.6f dq2(energy)=%.6f dq3(inertia1)=%.6f dq4(inertia2)=%.6f\n",
+               dq1, dq2, dq3, dq4);
+        printf("  CHECK isnan: dq1=%d dq2=%d dq3=%d dq4=%d\n",
+               isnan(dq1), isnan(dq2), isnan(dq3), isnan(dq4));
+    }
+
     // Combine terms to find new conduit flow
     denom = 1.0 + dq1;  // Simplified: no local losses in Stage 1
     q = (qOld - dq2 + dq3 + dq4) / denom;
 
-    // DEBUG: Log momentum equation terms for Link 1 (C2) at step 2-3, iter 0-1
-    if (j == 1 && g_routingStepCounter >= 2 && g_routingStepCounter <= 3 && steps <= 1) {
+    if (debugLink816) {
+        printf("  MOMENTUM: denom=%.6f (1.0 + dq1)\n", denom);
+        printf("  MOMENTUM: numerator=%.6f (qOld=%.6f - dq2=%.6f + dq3=%.6f + dq4=%.6f)\n",
+               (qOld - dq2 + dq3 + dq4), qOld, dq2, dq3, dq4);
+        printf("  MOMENTUM: q_new=%.6f isnan(q)=%d isinf(q)=%d\n", q, isnan(q), isinf(q));
+        printf("=== LINK_816 END ===\n\n");
+    }
+
+    // DEBUG: Log momentum equation terms for Link 1 (C2) at step 150-151, iter 0-1
+    if (j == 1 && g_routingStepCounter >= 150 && g_routingStepCounter <= 151 && steps <= 1) {
         printf("GPU_MOMENTUM_EQN[routingStep=%d iter=%d]:\n", g_routingStepCounter, steps);
         printf("  v=%.6f sigma=%.6f rho=%.6f\n", v, sigma, rho);
         printf("  aWtd=%.6f rWtd=%.6f\n", aWtd, rWtd);

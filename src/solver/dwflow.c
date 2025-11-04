@@ -135,21 +135,24 @@ void  dwflow_findConduitFlow(int j, int steps, double omega, double dt)
     // --- use Courant-modified length instead of conduit's actual length
     length = Conduit[k].modLength;
 
-    // DEBUG: Log Link 1 (C2: STOR1→J2) conduit flow inputs for step 2-3, iter 0-1
+    // DEBUG: Log Link 226 conduit flow inputs for step 2, iter 0-2
     static int cpuRoutingStepCounter = 0;
     static int lastSteps = -1;
     if (steps == 0 && lastSteps != 0) cpuRoutingStepCounter++;  // Increment at start of each routing step
     lastSteps = steps;
-    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
-        printf("CPU_CONDUIT_C2_IN[routingStep=%d iter=%d]:\n", cpuRoutingStepCounter, steps);
-        printf("  n1=%d(STOR1) depth=%.6f invert=%.6f\n", n1, y1, z1);
-        printf("  n2=%d(J2) depth=%.6f invert=%.6f\n", n2, y2, z2);
+    if (j == 226 && cpuRoutingStepCounter == 2 && steps >= 0 && steps <= 2) {
+        printf("CPU_LINK226_IN[step=%d iter=%d]:\n", cpuRoutingStepCounter, steps);
+        printf("  n1=%d depth=%.6f oldDepth=%.6f invert=%.6f z1=%.6f h1=%.6f y1=%.6f\n",
+               n1, Node[n1].newDepth, Node[n1].oldDepth, Node[n1].invertElev, z1, h1, y1);
+        printf("  n2=%d depth=%.6f oldDepth=%.6f invert=%.6f z2=%.6f h2=%.6f y2=%.6f\n",
+               n2, Node[n2].newDepth, Node[n2].oldDepth, Node[n2].invertElev, z2, h2, y2);
         printf("  offsets: off1=%.6f off2=%.6f\n",
                Link[j].offset1, Link[j].offset2);
-        printf("  xsect: type=%d yFull=%.6f aFull=%.6f rFull=%.6f rough=%.6f\n",
-               xsect->type, xsect->yFull, xsect->aFull, xsect->rFull, Conduit[k].roughness);
-        printf("  conduit: length=%.6f barrels=%d oldFlow=%.6f\n",
-               length, (int)barrels, qOld);
+        printf("  qOld=%.6f qLast=%.6f aOld=%.6f\n",
+               qOld, qLast, aOld);
+        printf("  length=%.6f barrels=%d rough=%.6f\n",
+               length, (int)barrels, Conduit[k].roughness);
+        printf("  omega=%.6f dt=%.6f\n", omega, dt);
     }
 
     // DEBUG: Log y1, y2 BEFORE findSurfArea for Link 1 at step 2-3, iter 0-1
@@ -280,8 +283,8 @@ void  dwflow_findConduitFlow(int j, int steps, double omega, double dt)
     denom = 1.0 + dq1 + dq5;
     q = (qOld - dq2 + dq3 + dq4 + dq6) / denom;
 
-    // DEBUG: Log momentum equation terms for Link 1 (C2) at step 2-3, iter 0-1
-    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
+    // DEBUG: Log momentum equation terms for Link 1 (C2) at step 150-151, iter 0-1
+    if (j == 1 && cpuRoutingStepCounter >= 150 && cpuRoutingStepCounter <= 151 && steps <= 1) {
         printf("CPU_MOMENTUM_EQN[routingStep=%d iter=%d]:\n", cpuRoutingStepCounter, steps);
         printf("  v=%.6f sigma=%.6f rho=%.6f\n", v, sigma, rho);
         printf("  aWtd=%.6f rWtd=%.6f\n", aWtd, rWtd);
@@ -291,8 +294,8 @@ void  dwflow_findConduitFlow(int j, int steps, double omega, double dt)
         printf("  h1=%.6f h2=%.6f dh=%.6f\n", h1, h2, h2 - h1);
     }
 
-    // DEBUG: Log Link 1 (C2) conduit flow outputs for step 2-3, iter 0-1
-    if (j == 1 && cpuRoutingStepCounter >= 2 && cpuRoutingStepCounter <= 3 && steps <= 1) {
+    // DEBUG: Log Link 1 (C2) conduit flow outputs for step 150-151, iter 0-1
+    if (j == 1 && cpuRoutingStepCounter >= 150 && cpuRoutingStepCounter <= 151 && steps <= 1) {
         printf("CPU_CONDUIT_C2_OUT[routingStep=%d iter=%d]:\n", cpuRoutingStepCounter, steps);
         printf("  q=%.6f qTotal=%.6f (barrels=%d)\n", q, q * barrels, (int)barrels);
         printf("  aMid=%.6f yMid=%.6f dqdh=%.6f froude=%.6f\n",
@@ -319,12 +322,22 @@ void  dwflow_findConduitFlow(int j, int steps, double omega, double dt)
             q = checkNormalFlow(j, q, y1, y2, a1, r1);
     }
 
+    // DEBUG: Log Link 226 output BEFORE relaxation
+    if (j == 226 && cpuRoutingStepCounter == 2 && steps >= 0 && steps <= 2) {
+        printf("CPU_LINK226_OUT[step=%d iter=%d]: q_raw=%.6f qLast=%.6f", cpuRoutingStepCounter, steps, q, qLast);
+    }
+
     // --- apply under-relaxation weighting between new & old flows;
     // --- do not allow change in flow direction without first being zero
     if ( steps > 0 )
     {
         q = (1.0 - omega) * qLast + omega * q;
         if ( q * qLast < 0.0 ) q = 0.001 * SGN(q);
+    }
+
+    // DEBUG: Log Link 226 output AFTER relaxation
+    if (j == 226 && cpuRoutingStepCounter == 2 && steps >= 0 && steps <= 2) {
+        printf(" q_relaxed=%.6f\n", q);
     }
 
     // --- check if user-supplied flow limit applies

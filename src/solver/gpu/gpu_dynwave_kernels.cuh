@@ -431,14 +431,29 @@ __device__ void gpu_setNodeDepth(
                g_depthRoutingStepCounter, steps, i, oldNetInflow, inflow, outflow, dQ, dV, surfArea, oldVolume, oldVolume + dV);
     }
 
-    // DEBUG: Detailed logging for node 852 (storage node being over-throttled by pump guard)
-    if (i == 852 && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 3 && steps <= 2) {
-        printf("GPU_NODE852_STOR[step=%d iter=%d]: oldVol=%.6f oldDepth=%.6f oldNetIn=%.6f\n",
+    // DEBUG: CRITICAL - WW-1002 (node 830) and WW-1003 (node 831) detailed balance
+    // These are the storage nodes draining at half the correct rate
+    if ((i == 830 || i == 831) && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 5) {
+        const char* name = (i == 830) ? "WW-1002" : "WW-1003";
+        printf("GPU_STORAGE_%s[step=%d iter=%d]: oldNetIn=%.9f oldVol=%.9f oldDepth=%.9f\n",
+               name, g_depthRoutingStepCounter, steps, oldNetInflow, oldVolume, yOld);
+        printf("  FLOWS: in=%.9f out=%.9f dQ=%.9f\n", inflow, outflow, dQ);
+        printf("  INTEGRATION: dV=%.9f = 0.5*(%.9f + %.9f)*%.6f, dt=%.6f\n",
+               dV, oldNetInflow, dQ, dt, dt);
+        printf("  RESULT: newVol=%.9f newDepth_prelim=%.9f surfArea=%.9f\n",
+               oldVolume + dV, yOld + (dV/surfArea), surfArea);
+    }
+
+    // DEBUG: COMPREHENSIVE logging for node 852 (WW-258 storage) - Iteration 6 storage volume tracking
+    if (i == 852 && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 3) {
+        printf("GPU_STOR852[step=%d iter=%d]: INPUTS: oldVol=%.9f oldDepth=%.9f oldNetIn=%.9f\n",
                g_depthRoutingStepCounter, steps, oldVolume, yOld, oldNetInflow);
-        printf("  inflow=%.6f outflow=%.6f dQ=%.6f dV=%.6f dt=%.6f\n",
-               inflow, outflow, dQ, dV, dt);
-        printf("  surfArea=%.6f newSurfArea=%.6f fullVol=%.6f fullDepth=%.6f\n",
-               surfArea, newSurfArea, fullVolume, fullDepth);
+        printf("  FLOWS: inflow=%.9f outflow=%.9f dQ=%.9f\n", inflow, outflow, dQ);
+        printf("  INTEGRATION: dV=%.9f (=0.5*(%.9f+%.9f)*%.6f) dt=%.6f\n",
+               dV, oldNetInflow, dQ, dt, dt);
+        printf("  AREA: surfArea=%.9f newSurfArea=%.9f\n", surfArea, newSurfArea);
+        printf("  GEOMETRY: fullVol=%.6f fullDepth=%.6f storageA0=%.6f storageA1=%.6f storageA2=%.6f\n",
+               fullVolume, fullDepth, storageA0, storageA1, storageA2);
     }
 
     // DEBUG: Comprehensive Node 1 (J2) input logging for routing steps 150-151, iterations 0-1
@@ -596,13 +611,24 @@ __device__ void gpu_setNodeDepth(
                dy, yNew, omega, *dYdT_out, dt);
     }
 
+    // DEBUG: Capture final converged depth for first 20 nodes at end of step 5 (iteration 0 of step 6)
+    // This shows the exact state being passed from step 5 → step 6
+    if (g_depthRoutingStepCounter == 6 && steps == 0 && i < 20) {
+        printf("GPU_STEP5_FINAL[node=%d]: depth=%.9f inflow=%.6f outflow=%.6f\n",
+               i, yOld, inflow, outflow);
+    }
+
     // --- save new depth
     *newDepth_out = yNew;
 
-    // DEBUG: Log outputs for node 852
-    if (i == 852 && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 3 && steps <= 2) {
-        printf("  OUTPUT: dy=%.6f yNew=%.6f newVol=%.6f overflow=%.6f\n",
-               dV/surfArea, yNew, *newVolume_out, *overflow_out);
+    // DEBUG: Log OUTPUTS for node 852 (continuation of STOR852 logging above)
+    if (i == 852 && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 3) {
+        printf("  OUTPUTS: dy=%.9f yNew=%.9f newVol=%.9f overflow=%.9f dYdT=%.9f\n",
+               dy, yNew, *newVolume_out, *overflow_out, *dYdT_out);
+        printf("  DEPTH_CHANGE: yOld=%.9f → yNew=%.9f (delta=%.9f)\n",
+               yOld, yNew, yNew - yOld);
+        printf("  VOLUME_CHANGE: oldVol=%.9f → newVol=%.9f (delta=%.9f)\n\n",
+               oldVolume, *newVolume_out, *newVolume_out - oldVolume);
     }
 
     if (debugThis) {
