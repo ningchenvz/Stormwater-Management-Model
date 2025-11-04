@@ -559,11 +559,19 @@ void execRouting()
         if ( NextRoutingStep > 0.0 )
         {
             routingStep = NextRoutingStep;
+            if (TotalStepCount <= 5) {
+                printf("SWMM_STEP[%ld]: Using pre-computed NextRoutingStep=%.6f\n",
+                       TotalStepCount, NextRoutingStep);
+            }
         }
         else
         {
             if ( !DoRouting ) routingStep = MIN(WetStep, ReportStep);
             else routingStep = routing_getRoutingStep(RouteModel, RouteStep);
+            if (TotalStepCount <= 5) {
+                printf("SWMM_STEP[%ld]: NextRoutingStep=0, computed routingStep=%.6f\n",
+                       TotalStepCount, routingStep);
+            }
         }
 
         if ( routingStep <= 0.0 )
@@ -603,10 +611,17 @@ void execRouting()
         if ( DoRouting && nextRoutingTime < RoutingDuration )
         {
             NextRoutingStep = routing_getRoutingStep(RouteModel, RouteStep);
+            if (TotalStepCount <= 5) {
+                printf("SWMM_STEP[%ld]: After routing_execute, computed NextRoutingStep=%.6f for step %ld\n",
+                       TotalStepCount, NextRoutingStep, TotalStepCount + 1);
+            }
         }
         else
         {
             NextRoutingStep = 0.0;
+            if (TotalStepCount <= 5) {
+                printf("SWMM_STEP[%ld]: Setting NextRoutingStep=0.0 (end of simulation)\n", TotalStepCount);
+            }
         }
     }
 

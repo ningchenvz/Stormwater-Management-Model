@@ -288,6 +288,15 @@ double dynwave_getRoutingStep(double fixedStep)
 
     // --- adjust step to be a multiple of a millisecond
     VariableStep = floor(1000.0 * VariableStep) / 1000.0;
+
+    // DEBUG: Log computed variable step
+    static int getStepCallCount = 0;
+    if (getStepCallCount < 10) {
+        printf("DEBUG_GETSTEP[call=%d]: fixedStep=%.6f → VariableStep=%.6f (GPU=%d)\n",
+               getStepCallCount, fixedStep, VariableStep, g_gpuConfig.useCuda);
+    }
+    getStepCallCount++;
+
     return VariableStep;
 }
 
@@ -331,8 +340,8 @@ int dynwave_execute(double tStep)
     // DEBUG: Log first few routing steps
     static int routingStepDebugCount = 0;
     int logThisStep = (routingStepDebugCount < 5);
-    if (logThisStep && g_gpuConfig.useCuda) {
-        printf("=== ROUTING STEP %d: tStep = %.6f sec ===\n", routingStepDebugCount, tStep);
+    if (logThisStep) {
+        printf("=== ROUTING STEP %d: tStep = %.6f sec (GPU=%d) ===\n", routingStepDebugCount, tStep, g_gpuConfig.useCuda);
     }
     routingStepDebugCount++;
 
@@ -939,6 +948,31 @@ int findNodeDepths(double dt)
 }
 
    // --- return FALSE if any non-Outfall node failed to converge
+    // DEBUG: Track convergence for first 5 routing steps
+    static int cpuResidualRoutingStep = 0;
+    static int cpuResidualLastIter = -1;
+    if (Steps == 0 && cpuResidualLastIter != 0) cpuResidualRoutingStep++;
+    cpuResidualLastIter = Steps;
+
+    if (cpuResidualRoutingStep >= 1 && cpuResidualRoutingStep <= 20) {
+        int notConvergedCount = 0;
+        int totalNodes = 0;
+
+        for (i = 0; i < Nobjects[NODE]; i++) {
+            if (Node[i].type == OUTFALL) continue;
+            totalNodes++;
+            if (!Xnode[i].converged) {
+                notConvergedCount++;
+            }
+        }
+
+        int convergedCount = totalNodes - notConvergedCount;
+        printf("CPU_RESIDUAL[routeStep=%d iter=%d]: notConverged=%d/%d converged=%d/%d tol=%.6f\n",
+               cpuResidualRoutingStep, Steps,
+               notConvergedCount, totalNodes,
+               convergedCount, totalNodes, HeadTol);
+    }
+
     for (i = 0; i < Nobjects[NODE]; i++)
     {
         if ( Node[i].type == OUTFALL ) continue;
@@ -1002,12 +1036,33 @@ void setNodeDepth(int i, double dt)
     dQ = Node[i].inflow - Node[i].outflow;
     dV = 0.5 * (Node[i].oldNetInflow + dQ) * dt;
 
-    // DEBUG: Comprehensive Node 1 (J2, index 1) input logging for routing steps 1-3, iterations 0-2
+    // DEBUG: Detailed logging for node 852 (storage being over-throttled)
     static int cpu_routingStepCounter = 0;
     static int cpu_lastSteps = -1;
+    static int firstStorageIdxCPU = -1;
     if (Steps == 0 && cpu_lastSteps != 0) cpu_routingStepCounter++;
     cpu_lastSteps = Steps;
-    if (i == 1 && cpu_routingStepCounter >= 1 && cpu_routingStepCounter <= 3 && Steps <= 2) {
+
+    // Log node 852 specifically
+    if (i == 852 && cpu_routingStepCounter >= 1 && cpu_routingStepCounter <= 3 && Steps <= 2) {
+        printf("CPU_NODE852_STOR[step=%d iter=%d]: oldVol=%.6f oldDepth=%.6f oldNetIn=%.6f\n",
+               cpu_routingStepCounter, Steps, Node[i].oldVolume, yOld, Node[i].oldNetInflow);
+        printf("  inflow=%.6f outflow=%.6f dQ=%.6f dV=%.6f dt=%.6f\n",
+               Node[i].inflow, Node[i].outflow, dQ, dV, dt);
+        printf("  surfArea=%.6f newSurfArea=%.6f fullVol=%.6f fullDepth=%.6f\n",
+               surfArea, Xnode[i].newSurfArea, Node[i].fullVolume, Node[i].fullDepth);
+    }
+
+    if (Node[i].type == STORAGE && cpu_routingStepCounter <= 3 && Steps == 0) {
+        if (firstStorageIdxCPU == -1) firstStorageIdxCPU = i;
+        if (i == firstStorageIdxCPU) {
+            printf("CPU_VOL_INT[step=%d iter=%d node=%d %s]: oldNetIn=%.6f in=%.6f out=%.6f dQ=%.6f dV=%.6f surfArea=%.6f oldVol=%.6f\n",
+                   cpu_routingStepCounter, Steps, i, Node[i].ID, Node[i].oldNetInflow, Node[i].inflow, Node[i].outflow, dQ, dV, surfArea, Node[i].oldVolume);
+        }
+    }
+
+    // DEBUG: Comprehensive Node 1 (J2, index 1) input logging for routing steps 150-151, iterations 0-1
+    if (i == 1 && cpu_routingStepCounter >= 150 && cpu_routingStepCounter <= 151 && Steps <= 1) {
         printf("CPU_NODE1_INPUTS[routingStep=%d iter=%d]:\n", cpu_routingStepCounter, Steps);
         printf("  oldDepth=%.6f oldVolume=%.6f oldNetInflow=%.6f\n",
                Node[i].oldDepth, Node[i].oldVolume, Node[i].oldNetInflow);
@@ -1104,6 +1159,22 @@ void setNodeDepth(int i, double dt)
     // --- save new depth for node
     Node[i].newDepth = yNew;
 
+    // DEBUG: Detailed trace for node 12 (J-229-OUT) at early steps to diagnose depth halving
+    if (i == 12 && cpu_routingStepCounter <= 3 && Steps <= 2) {
+        printf("CPU_NODE12[step=%d iter=%d]: oldDepth=%.9f yLast=%.9f inflow=%.6f outflow=%.6f\n",
+               cpu_routingStepCounter, Steps, yOld, Node[i].newDepth, Node[i].inflow, Node[i].outflow);
+        printf("  oldNetInflow=%.9f dQ=%.6f dV=%.9f surfArea=%.9f newSurfArea=%.9f\n",
+               Node[i].oldNetInflow, dQ, dV, surfArea, Xnode[i].newSurfArea);
+        printf("  dy_raw=%.9f yNew=%.9f omega=%.3f dYdT=%.6f dt=%.6f\n",
+               dy, yNew, Omega, Xnode[i].dYdT, dt);
+    }
+
+    // DEBUG: Log outputs for node 852
+    if (i == 852 && cpu_routingStepCounter >= 1 && cpu_routingStepCounter <= 3 && Steps <= 2) {
+        printf("  OUTPUT: dy=%.6f yNew=%.6f newVol=%.6f overflow=%.6f\n",
+               dV/surfArea, yNew, Node[i].newVolume, Node[i].overflow);
+    }
+
     // DEBUG: Track divergence for J2 (node index 1) during routing steps 0-3
     static int cpu_diverge_routingStep = 0;
     static int cpu_diverge_lastIter = -1;
@@ -1192,6 +1263,7 @@ double getVariableStep(double maxStep)
         }
         printf("    Total links with flow > 0.01: %d\n", sampleCount);
     }
+
     getVarStepCount++;
 
     // --- find stable time step for links & then nodes
@@ -1238,6 +1310,11 @@ double getLinkStep(double tMin, int *minLink)
     double t;                           // time step (sec)
     double tLink = tMin;                // critical link time step (sec)
 
+    // DEBUG: Log first call details
+    static int linkStepCallCount = 0;
+    int activeLinks = 0;
+    int skippedByFlow = 0, skippedByArea = 0, skippedByFroude = 0;
+
     // --- examine each conduit link
     for ( i = 0; i < Nobjects[LINK]; i++ )
     {
@@ -1246,10 +1323,26 @@ double getLinkStep(double tMin, int *minLink)
             // --- skip conduits with negligible flow, area or Fr
             k = Link[i].subIndex;
             q = fabs(Link[i].newFlow) / Conduit[k].barrels;
-            if ( q <= FUDGE 
-            ||   Conduit[k].a1 <= FUDGE
-            ||   Link[i].froude <= 0.01 
-               ) continue;
+
+            if (linkStepCallCount == 0 && i < 10) {
+                printf("  CPU getLinkStep[link=%d]: newFlow=%.6f q=%.6f a1=%.6f froude=%.6f\n",
+                       i, Link[i].newFlow, q, Conduit[k].a1, Link[i].froude);
+            }
+
+            if ( q <= FUDGE ) {
+                skippedByFlow++;
+                continue;
+            }
+            if ( Conduit[k].a1 <= FUDGE ) {
+                skippedByArea++;
+                continue;
+            }
+            if ( Link[i].froude <= 0.01 ) {
+                skippedByFroude++;
+                continue;
+            }
+
+            activeLinks++;
 
             // --- compute time step to satisfy Courant condition
             t = Link[i].newVolume / Conduit[k].barrels / q;
@@ -1261,9 +1354,20 @@ double getLinkStep(double tMin, int *minLink)
             {
                 tLink = t;
                 *minLink = i;
+                if (linkStepCallCount == 0) {
+                    printf("  CPU getLinkStep: NEW MIN link=%d t=%.6f (vol=%.3f q=%.3f modLen=%.1f len=%.1f Fr=%.3f)\n",
+                           i, t, Link[i].newVolume, q, Conduit[k].modLength, link_getLength(i), Link[i].froude);
+                }
             }
         }
     }
+
+    if (linkStepCallCount == 0) {
+        printf("  CPU getLinkStep[call=0]: checked %d conduits, active=%d skipped(flow=%d area=%d froude=%d) → tLink=%.6f (minLink=%d)\n",
+               Nobjects[LINK], activeLinks, skippedByFlow, skippedByArea, skippedByFroude, tLink, *minLink);
+    }
+    linkStepCallCount++;
+
     return tLink;
 }
 
@@ -1284,21 +1388,43 @@ double getNodeStep(double tMin, int *minNode)
     double t1;                          // time needed to reach depth limit (sec)
     double tNode = tMin;                // critical node time step (sec)
 
+    // DEBUG: Log first call details
+    static int nodeStepCallCount = 0;
+    int activeNodes = 0;
+    int skippedByType = 0, skippedByDepth = 0, skippedByMaxDepth = 0, skippedByDydt = 0;
+
     // --- find smallest time so that estimated change in nodal depth
     //     does not exceed safety factor * maxdepth
     for ( i = 0; i < Nobjects[NODE]; i++ )
     {
         // --- see if node can be skipped
-        if ( Node[i].type == OUTFALL ) continue;
-        if ( Node[i].newDepth <= FUDGE) continue;
+        if ( Node[i].type == OUTFALL ) {
+            skippedByType++;
+            continue;
+        }
+        if ( Node[i].newDepth <= FUDGE) {
+            skippedByDepth++;
+            continue;
+        }
         if ( Node[i].newDepth  + FUDGE >=
-             Node[i].crownElev - Node[i].invertElev ) continue;
+             Node[i].crownElev - Node[i].invertElev ) {
+            skippedByDepth++;
+            continue;
+        }
 
         // --- define max. allowable depth change using crown elevation
         maxDepth = (Node[i].crownElev - Node[i].invertElev) * 0.25;
-        if ( maxDepth < FUDGE ) continue;
+        if ( maxDepth < FUDGE ) {
+            skippedByMaxDepth++;
+            continue;
+        }
         dYdT = Xnode[i].dYdT;
-        if (dYdT < FUDGE ) continue;
+        if (dYdT < FUDGE ) {
+            skippedByDydt++;
+            continue;
+        }
+
+        activeNodes++;
 
         // --- compute time to reach max. depth & compare with critical time
         t1 = maxDepth / dYdT;
@@ -1306,7 +1432,18 @@ double getNodeStep(double tMin, int *minNode)
         {
             tNode = t1;
             *minNode = i;
+            if (nodeStepCallCount == 0) {
+                printf("  CPU getNodeStep: NEW MIN node=%d (%s) t1=%.6f (maxDepth=%.3f dYdT=%.6f newDepth=%.3f)\n",
+                       i, Node[i].ID, t1, maxDepth, dYdT, Node[i].newDepth);
+            }
         }
     }
+
+    if (nodeStepCallCount == 0) {
+        printf("  CPU getNodeStep[call=0]: checked %d nodes, active=%d skipped(type=%d depth=%d maxDepth=%d dydt=%d) → tNode=%.6f (minNode=%d)\n",
+               Nobjects[NODE], activeNodes, skippedByType, skippedByDepth, skippedByMaxDepth, skippedByDydt, tNode, *minNode);
+    }
+    nodeStepCallCount++;
+
     return tNode;
 }

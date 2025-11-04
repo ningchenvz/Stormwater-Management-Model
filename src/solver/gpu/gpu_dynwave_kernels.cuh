@@ -88,14 +88,24 @@ __device__ double gpu_storage_getVolume(
     switch (storageShape) {
         case GPU_STORAGE_TABULAR:
             if (storageCurve >= 0 && curves != NULL && points != NULL) {
+                double depthUser = depth * ucfLength;
                 double volUser = gpu_table_getStorageVolume(
                     storageCurve,
-                    depth * ucfLength,
+                    depthUser,
                     curves->d_dataStart,
                     curves->d_dataCount,
                     points->d_xValues,
                     points->d_yValues);
-                return volUser / ucfVolume;
+                double volInternal = volUser / ucfVolume;
+
+                // Log for curve 10 (STOR-10)
+                if (storageCurve == 10 && depth > 0.0) {
+                    printf("    gpu_storage_getVolume[curve=%d]: depth_internal=%.6f → depth_user=%.6f → vol_user=%.6f → vol_internal=%.6f\n",
+                           storageCurve, depth, depthUser, volUser, volInternal);
+                    printf("      CHECK: volInternal isnan=%d isinf=%d\n", isnan(volInternal), isinf(volInternal));
+                }
+
+                return volInternal;
             }
             return 0.0;
 
@@ -391,28 +401,48 @@ __device__ void gpu_setNodeDepth(
                inflow, outflow, oldNetInflow, dt, surfArea, newSurfArea, minSurfArea);
     }
 
-    // DEBUG: Trace STOR-10 (node 926) surface area accumulation (first 3 routing steps)
-    #ifdef GPU_DEBUG_SURF
-    if (i == 926 && steps <= 3 && nodeType == GPU_STORAGE) {
-        printf("STOR10_DEPTH[step=%d]: newSurfArea(conduits)=%.3f minSurfArea=%.3f surfArea(used)=%.3f\n",
-               steps, newSurfArea, minSurfArea, surfArea);
-        printf("  inflow=%.6f outflow=%.6f dQ=%.6f oldNet=%.6f\n",
-               inflow, outflow, inflow - outflow, oldNetInflow);
-        printf("  oldVol=%.3f yOld=%.6f yLast=%.6f fullDepth=%.3f dt=%.6f\n",
-               oldVolume, yOld, yLast, fullDepth, dt);
-        printf("  dV_calc=(0.5*(%.6f + %.6f)*%.6f)=%.6f → dy=%.6f\n",
-               oldNetInflow, inflow - outflow, dt,
-               0.5 * (oldNetInflow + (inflow - outflow)) * dt,
-               0.5 * (oldNetInflow + (inflow - outflow)) * dt / surfArea);
+    // DEBUG: Trace problem nodes (247, 928) and STOR-10 (926) - NaN INVESTIGATION
+    bool debugThis = false; // Disabled for clean testing
+    // bool debugThis = ((i == 247 || i == 928 || i == 926) && g_depthRoutingStepCounter <= 5);
+
+    if (debugThis) {
+        const char* nodeTypeStr = (nodeType == 0) ? "JUNC" : (nodeType == 2) ? "STOR" : "OTHER";
+        printf("\n=== NODE_%d_%s[routeStep=%d iter=%d] ===\n", i, nodeTypeStr, g_depthRoutingStepCounter, steps);
+        printf("  INPUTS: oldVol=%.6f oldDepth=%.6f yLast=%.6f\n", oldVolume, yOld, yLast);
+        printf("  INPUTS: inflow=%.6f outflow=%.6f oldNetInflow=%.6f\n", inflow, outflow, oldNetInflow);
+        printf("  INPUTS: newSurfArea=%.6f minSurfArea=%.6f → surfArea(used)=%.6f\n",
+               newSurfArea, minSurfArea, surfArea);
+        printf("  INPUTS: fullDepth=%.3f fullVolume=%.3f dt=%.6f\n", fullDepth, fullVolume, dt);
+        printf("  CHECK isnan: oldDepth=%d yLast=%d inflow=%d outflow=%d surfArea=%d\n",
+               isnan(yOld), isnan(yLast), isnan(inflow), isnan(outflow), isnan(surfArea));
+        if (nodeType == GPU_STORAGE) {
+            printf("  STORAGE: shape=%d curve=%d a0=%.3f a1=%.3f a2=%.3f\n",
+                   storageShape, storageCurve, storageA0, storageA1, storageA2);
+        }
     }
-    #endif
 
     // --- determine average net flow volume into node over the time step
     dQ = inflow - outflow;
     dV = 0.5 * (oldNetInflow + dQ) * dt;
 
-    // DEBUG: Comprehensive Node 1 (J2) input logging for routing steps 1-3, iterations 0-2
-    if (i == 1 && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 3 && steps <= 2) {
+    // DEBUG: Log volume integration for ALL storage nodes during first 3 routing steps, iteration 0 only
+    if (nodeType == GPU_STORAGE && g_depthRoutingStepCounter <= 3 && steps == 0) {
+        printf("VOL_INT[step=%d iter=%d node=%d]: oldNetIn=%.6f in=%.6f out=%.6f dQ=%.6f dV=%.6f surfArea=%.6f oldVol=%.6f newVol=%.6f\n",
+               g_depthRoutingStepCounter, steps, i, oldNetInflow, inflow, outflow, dQ, dV, surfArea, oldVolume, oldVolume + dV);
+    }
+
+    // DEBUG: Detailed logging for node 852 (storage node being over-throttled by pump guard)
+    if (i == 852 && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 3 && steps <= 2) {
+        printf("GPU_NODE852_STOR[step=%d iter=%d]: oldVol=%.6f oldDepth=%.6f oldNetIn=%.6f\n",
+               g_depthRoutingStepCounter, steps, oldVolume, yOld, oldNetInflow);
+        printf("  inflow=%.6f outflow=%.6f dQ=%.6f dV=%.6f dt=%.6f\n",
+               inflow, outflow, dQ, dV, dt);
+        printf("  surfArea=%.6f newSurfArea=%.6f fullVol=%.6f fullDepth=%.6f\n",
+               surfArea, newSurfArea, fullVolume, fullDepth);
+    }
+
+    // DEBUG: Comprehensive Node 1 (J2) input logging for routing steps 150-151, iterations 0-1
+    if (i == 1 && g_depthRoutingStepCounter >= 150 && g_depthRoutingStepCounter <= 151 && steps <= 1) {
         printf("GPU_NODE1_INPUTS[routingStep=%d iter=%d]:\n", g_depthRoutingStepCounter, steps);
         printf("  oldDepth=%.6f oldVolume=%.6f oldNetInflow=%.6f\n", yOld, oldVolume, oldNetInflow);
         printf("  inflow=%.6f outflow=%.6f dQ=%.6f\n", inflow, outflow, dQ);
@@ -445,19 +475,26 @@ __device__ void gpu_setNodeDepth(
 
         // --- apply under-relaxation
         if (steps > 0) {
-            #ifdef GPU_DEBUG_SURF
-            if (i == 926 && steps <= 3) {
-                printf("  RELAX[i=%d step=%d]: yLast=%.6f yNew_raw=%.6f omega=%.3f\n",
-                       i, steps, yLast, yNew, omega);
+            if (debugThis) {
+                printf("  CALC: dQ=%.6f dV=%.6f dy=%.6f yNew_raw=%.6f\n",
+                       dQ, dV, dy, yNew);
+                printf("  CHECK isnan: dQ=%d dV=%d dy=%d yNew_raw=%d\n",
+                       isnan(dQ), isnan(dV), isnan(dy), isnan(yNew));
+                printf("  RELAX: omega=%.3f yLast=%.6f\n", omega, yLast);
             }
-            #endif
             yNew = (1.0 - omega) * yLast + omega * yNew;
-            #ifdef GPU_DEBUG_SURF
-            if (i == 926 && steps <= 3) {
-                printf("  RELAX[i=%d step=%d]: yNew_relaxed=%.6f (moved %.6f)\n",
-                       i, steps, yNew, yNew - yLast);
+            if (debugThis) {
+                printf("  RELAX: yNew_relaxed=%.6f (moved %.6f)\n",
+                       yNew, yNew - yLast);
+                printf("  CHECK isnan: yNew_relaxed=%d\n", isnan(yNew));
             }
-            #endif
+        } else {
+            if (debugThis) {
+                printf("  CALC: dQ=%.6f dV=%.6f dy=%.6f yNew_raw=%.6f (NO RELAX step=0)\n",
+                       dQ, dV, dy, yNew);
+                printf("  CHECK isnan: dQ=%d dV=%d dy=%d yNew_raw=%d\n",
+                       isnan(dQ), isnan(dV), isnan(dy), isnan(yNew));
+            }
         }
 
         // --- don't allow ponded node to drop much below full depth
@@ -514,6 +551,10 @@ __device__ void gpu_setNodeDepth(
             newVolume_out);
     }
     else {
+        if (debugThis) {
+            printf("  BEFORE VOLUME CALC: yNew=%.6f (about to call gpu_node_getVolume)\n", yNew);
+        }
+
         *newVolume_out = gpu_node_getVolume(
             nodeType,
             yNew,
@@ -528,13 +569,49 @@ __device__ void gpu_setNodeDepth(
             ucfVolume,
             curves,
             curvePoints);
+
+        if (debugThis) {
+            printf("  AFTER VOLUME CALC: newVolume=%.6f\n", *newVolume_out);
+            printf("  CHECK NaN: newVolume isnan=%d isinf=%d\n",
+                   isnan(*newVolume_out), isinf(*newVolume_out));
+        }
     }
 
     // --- compute rate of depth change
     *dYdT_out = fabs(yNew - yOld) / dt;
 
+    // DEBUG: Log dYdT calculation for first 10 nodes with significant dYdT
+    if (g_depthRoutingStepCounter == 0 && *dYdT_out > 0.01 && i < 100) {
+        printf("  GPU dYdT[node=%d step=%d iter=%d]: yNew=%.6f yOld=%.6f dt=%.6f → dYdT=%.6f\n",
+               i, g_depthRoutingStepCounter, steps, yNew, yOld, dt, *dYdT_out);
+    }
+
+    // DEBUG: Detailed trace for node 12 (J-229-OUT) at early steps to diagnose depth halving
+    if (i == 12 && g_depthRoutingStepCounter <= 3 && steps <= 2) {
+        printf("GPU_NODE12[step=%d iter=%d]: oldDepth=%.9f yLast=%.9f inflow=%.6f outflow=%.6f\n",
+               g_depthRoutingStepCounter, steps, yOld, yLast, inflow, outflow);
+        printf("  oldNetInflow=%.9f dQ=%.6f dV=%.9f surfArea=%.9f newSurfArea=%.9f\n",
+               oldNetInflow, dQ, dV, surfArea, newSurfArea);
+        printf("  dy_raw=%.9f yNew=%.9f omega=%.3f dYdT=%.6f dt=%.6f\n",
+               dy, yNew, omega, *dYdT_out, dt);
+    }
+
     // --- save new depth
     *newDepth_out = yNew;
+
+    // DEBUG: Log outputs for node 852
+    if (i == 852 && g_depthRoutingStepCounter >= 1 && g_depthRoutingStepCounter <= 3 && steps <= 2) {
+        printf("  OUTPUT: dy=%.6f yNew=%.6f newVol=%.6f overflow=%.6f\n",
+               dV/surfArea, yNew, *newVolume_out, *overflow_out);
+    }
+
+    if (debugThis) {
+        printf("  FINAL: newDepth=%.6f newVolume=%.6f dYdT=%.6f\n",
+               *newDepth_out, *newVolume_out, *dYdT_out);
+        printf("  CHECK isnan: newDepth=%d newVolume=%d dYdT=%d\n",
+               isnan(*newDepth_out), isnan(*newVolume_out), isnan(*dYdT_out));
+        printf("=== END NODE_%d ===\n\n", i);
+    }
 }
 
 #endif // GPU_DYNWAVE_KERNELS_CUH
